@@ -1,0 +1,41 @@
+%YAML:1.0
+################################################################################
+# NvDCF跟踪器配置 - 准确度优先
+# 用于车辆跟踪，处理假阴性
+################################################################################
+
+NvDCF:
+  # [General]
+  useUniqueID: 1  # 使用唯一ID
+  maxTargetsPerStream: 99  # 最多跟踪目标数
+  
+  # [Assignment]
+  # 匹配参数
+  minMatchingScore4Overall: 0.4  # 总体匹配分数阈值
+  minMatchingScore4ReidSimilarity: 0.6
+  minTrackingConfidence: 0.5  # 最小跟踪置信度
+  
+  # [StateEstimator]
+  # 状态估计器（卡尔曼滤波）
+  useBufferedOutput: 0
+  
+  # [TargetManagement]
+  # 目标管理
+  maxShadowTrackingAge: 30  # 假阴性容忍：30帧
+  probationAge: 3  # 新目标确认帧数
+  earlyTerminationAge: 1
+  
+  # [TrajectoryManagement]
+  # 轨迹管理
+  useTrackSmoothing: 1  # 使用轨迹平滑
+  
+  # [DataAssociator]
+  # 数据关联
+  gating Threshold: 0.7
+  associationMatchType: 0  # IoU匹配
+  
+  # [FeatureExtractor]
+  # 特征提取（用于ReID）
+  useReID: 0  # 暂不使用ReID
+
+

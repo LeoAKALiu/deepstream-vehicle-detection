@@ -1,0 +1,38 @@
+# 车辆检测系统日志轮转配置
+# 安装到 /etc/logrotate.d/vehicle-detection
+
+/home/liubo/Download/deepstream-vehicle-detection/logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 liubo liubo
+    sharedscripts
+    postrotate
+        # 如果使用 systemd，可以重新加载服务
+        # systemctl reload vehicle-detection.service > /dev/null 2>&1 || true
+    endscript
+}
+
+/home/liubo/Download/deepstream-vehicle-detection/logs/startup.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 liubo liubo
+}
+
+/tmp/vehicle_detection.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 liubo liubo
+}
+

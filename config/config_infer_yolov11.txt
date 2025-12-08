@@ -1,0 +1,67 @@
+# YOLOv11 TensorRT推理配置
+# 用于DeepStream nvinfer插件
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=../models/best.onnx
+model-engine-file=../models/yolov11.engine
+labelfile-path=../config/labels.txt
+batch-size=1
+network-mode=2
+num-detected-classes=10
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+#parse-bbox-func-name=NvDsInferParseYolo
+#custom-lib-path=../python_apps/libnvdsinfer_custom_yolo.so
+output-blob-names=output0
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.5
+topk=300
+
+## 工程车辆类别（绿色框）
+[class-attrs-0]
+# excavator - 挖掘机
+roi-top-offset=0
+roi-bottom-offset=0
+detected-min-w=0
+detected-min-h=0
+detected-max-w=0
+detected-max-h=0
+
+[class-attrs-1]
+# bulldozer - 推土机
+
+[class-attrs-2]
+# roller - 压路机
+
+[class-attrs-3]
+# loader - 装载机
+
+[class-attrs-4]
+# dump-truck - 自卸车
+
+[class-attrs-5]
+# concrete-mixer - 混凝土搅拌车
+
+[class-attrs-6]
+# pump-truck - 泵车
+
+[class-attrs-7]
+# crane - 起重机
+
+## 社会车辆类别（蓝色框，需要车牌识别）
+[class-attrs-8]
+# truck - 卡车
+
+[class-attrs-9]
+# car - 轿车
+
+

@@ -1,0 +1,46 @@
+[Unit]
+Description=Vehicle Detection System - Real-time Construction Vehicle Detection
+After=network.target usb_device.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liubo
+Group=liubo
+WorkingDirectory=/home/liubo/Download/deepstream-vehicle-detection
+Environment="PYTHONPATH=/home/liubo/Download/deepstream-vehicle-detection:/home/liubo/Download/deepstream-vehicle-detection/python_apps"
+Environment="CUDA_VISIBLE_DEVICES=0"
+
+# 启动命令
+ExecStart=/home/liubo/Download/deepstream-vehicle-detection/scripts/start_vehicle_detection.sh
+
+# 停止命令
+ExecStop=/home/liubo/Download/deepstream-vehicle-detection/scripts/stop_vehicle_detection.sh
+
+# 重启策略
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 资源限制
+LimitNOFILE=65536
+MemoryMax=4G
+CPUQuota=200%
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vehicle-detection
+
+# 超时设置
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

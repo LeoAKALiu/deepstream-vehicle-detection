@@ -1,0 +1,125 @@
+# ============================================
+# BLE信标白名单配置文件
+# ============================================
+# 
+# 说明：
+# 1. 每个摄像头区域维护独立的白名单
+# 2. 只有白名单中的信标会被用于匹配
+# 3. 通过小程序扫码绑定时，自动添加到此文件
+# 4. mac地址格式：AA:BB:CC:DD:EE:FF（大写，冒号分隔）
+
+# 全局配置
+global_config:
+  # RSSI阈值配置（信号强度过滤）
+  rssi_thresholds:
+    very_close: -50   # < 5米（非常近）
+    close: -60        # 5-10米（近）
+    medium: -70       # 10-20米（中等）
+    far: -80          # 20-50米（远）
+    default: -70      # 默认阈值（用于匹配）
+  
+  # 距离匹配配置
+  distance_match:
+    tolerance: 3.0    # 深度与RSSI距离差容忍度（米）
+    depth_priority: true  # 优先使用深度相机距离
+  
+  # 时间窗口配置
+  time_window:
+    min_duration: 3.0      # 信标需持续出现时间（秒）
+    history_size: 100      # 保留历史记录数量
+  
+  # 匹配置信度阈值
+  confidence_threshold: 0.6  # 最低匹配置信度
+  
+  # 多目标匹配配置
+  multi_target_match:
+    enabled: true              # 是否启用多目标-多信标匹配
+    match_cost_threshold: 5.0  # 最小代价阈值（米），超过此值判定为"不确定"
+    time_stability_weight: 0.3  # 时间稳定度权重（0.0-1.0）
+    stability_window: 3.0       # 稳定度计算时间窗口（秒）
+
+
+# 摄像头区域配置
+cameras:
+  # 摄像头1：主入口
+  camera_01:
+    name: "主入口监控"
+    location:
+      lat: 0.0  # 纬度（可选，便于地图显示）
+      lng: 0.0  # 经度
+    coverage_radius: 30  # 有效覆盖半径（米）
+    rssi_threshold: -70  # 此区域的RSSI阈值
+    
+    # 已注册信标白名单
+    beacons:
+      - mac: "45:C6:6A:F2:46:19"
+        vehicle_type: "excavator"
+        plate_number: ""
+        company: "济南城建集团"
+        notes: "1号挖掘机"
+        active: true
+      
+      # - mac: "AA:BB:CC:DD:EE:02"
+      #   vehicle_type: "loader"
+      #   plate_number: "粤B23456"
+      #   company: "XX建设集团"
+      #   notes: "2号铲车"
+      #   active: true
+      
+      # - mac: "AA:BB:CC:DD:EE:03"
+      #   vehicle_type: "dump_truck"
+      #   plate_number: "粤B34567"
+      #   company: "YY运输公司"
+      #   notes: "3号运输车"
+      #   active: true
+
+  # 摄像头2：东区作业面
+  # camera_02:
+  #   name: "东区作业面监控"
+  #   location:
+  #     lat: 0.0
+  #     lng: 0.0
+  #   coverage_radius: 50
+  #   rssi_threshold: -75
+    
+  #   beacons:
+  #     - mac: "AA:BB:CC:DD:EE:04"
+  #       vehicle_type: "excavator"
+  #       plate_number: "粤B45678"
+  #       company: "ZZ工程公司"
+  #       notes: "4号挖掘机"
+  #       active: true
+      
+  #     - mac: "AA:BB:CC:DD:EE:05"
+  #       vehicle_type: "crane"
+  #       plate_number: "粤B56789"
+  #       company: "ZZ工程公司"
+  #       notes: "5号吊车"
+  #       active: false  # 已停用
+
+
+# ============================================
+# 配置使用示例
+# ============================================
+#
+# 1. 添加新信标：
+#    在对应camera下的beacons列表中添加新条目
+#
+# 2. 停用信标：
+#    将 active 改为 false（不会被匹配）
+#
+# 3. 调整RSSI阈值：
+#    修改 camera 的 rssi_threshold 值
+#
+# 4. 微信小程序对接：
+#    小程序扫码后，通过API自动写入此文件
+#    POST /api/beacon/bind
+#    {
+#      "mac": "AA:BB:CC:DD:EE:FF",
+#      "camera_id": "camera_01",
+#      "vehicle_type": "excavator",
+#      "plate_number": "粤BXXXXX",
+#      "company": "XX公司"
+#    }
+
+

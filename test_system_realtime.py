@@ -1,0 +1,2449 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+完整车辆检测系统 - 实时测试
+使用Orbbec相机进行实时检测
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'python_apps'))
+
+import cv2
+import numpy as np
+import time
+import argparse
+from collections import defaultdict
+from datetime import datetime
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+from PIL import Image, ImageDraw, ImageFont
+from concurrent.futures import ThreadPoolExecutor, Future
+from queue import Queue
+import threading
+
+# 导入自定义模块
+from cassia_local_client import CassiaLocalClient
+from orbbec_depth import OrbbecDepthCamera
+from beacon_filter import BeaconFilter
+from config_loader import get_config
+from byte_tracker import ByteTracker
+from hardware_recovery import HardwareRecovery
+from network_recovery import NetworkRecovery
+
+# 导入云端集成模块（可选）
+try:
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'jetson-client'))
+    from main_integration import SentinelIntegration
+    from detection_result import DetectionResult
+    from config import CloudConfig
+    CLOUD_AVAILABLE = True
+except ImportError as e:
+    CLOUD_AVAILABLE = False
+    print(f"⚠ 云端集成模块未安装: {e}")
+
+try:
+    import hyperlpr3 as lpr3
+    LPR_AVAILABLE = True
+except ImportError:
+    LPR_AVAILABLE = False
+    print("⚠ HyperLPR3未安装，车牌识别功能将不可用")
+
+# 自定义模型类别（工程车辆检测模型）
+CUSTOM_CLASSES = {
+    0: 'excavator',       # 挖掘机
+    1: 'bulldozer',       # 推土机
+    2: 'roller',          # 压路机
+    3: 'loader',          # 装载机
+    4: 'dump-truck',      # 自卸车
+    5: 'concrete-mixer',  # 混凝土搅拌车
+    6: 'pump-truck',      # 泵车
+    7: 'truck',           # 卡车
+    8: 'crane',           # 起重机
+    9: 'car',             # 小汽车
+}
+
+# 车辆类别映射（自定义模型）
+VEHICLE_CLASSES = {
+    'excavator': 'construction',
+    'bulldozer': 'construction',
+    'roller': 'construction',
+    'loader': 'construction',
+    'dump-truck': 'construction',
+    'concrete-mixer': 'construction',
+    'pump-truck': 'construction',
+    'truck': 'construction',
+    'crane': 'construction',
+    'car': 'civilian',  # 社会车辆
+}
+
+# 颜色配置（BGR格式）
+COLORS = {
+    'construction': (0, 140, 255),   # 橙色
+    'civilian': (0, 255, 0),          # 绿色
+    'unregistered': (0, 0, 255),      # 红色
+}
+
+
+class AsyncLPRProcessor:
+    """异步车牌识别处理器"""
+    
+    def __init__(self, lpr_detector, max_workers=2, max_queue_size=10):
+        """
+        初始化异步LPR处理器
+        
+        Args:
+            lpr_detector: HyperLPR检测器
+            max_workers: 线程池最大工作线程数
+            max_queue_size: 任务队列最大大小
+        """
+        self.lpr_detector = lpr_detector
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.task_queue = Queue(maxsize=max_queue_size)
+        self.pending_tasks = {}  # {track_id: Future}
+        self.last_recognition_time = {}  # {track_id: timestamp}
+        self.recognition_results = {}  # {track_id: (plate_number, confidence)}
+        self.lock = threading.Lock()
+        
+        # 配置
+        self.min_recognition_interval = 1.0  # 每个track_id最小识别间隔（秒）
+        self.max_retries = 3  # 最大重试次数
+        self.retry_delay = 0.5  # 重试延迟（秒）
+        
+    def _check_roi_quality(self, roi):
+        """
+        检查ROI质量（清晰度）
+        
+        Args:
+            roi: 车辆ROI图像
+            
+        Returns:
+            bool: 是否通过质量检查
+        """
+        if roi is None or roi.size == 0:
+            return False
+        
+        # 使用拉普拉斯方差评估清晰度
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        # 清晰度阈值（可调整）
+        clarity_threshold = 100.0
+        
+        return laplacian_var > clarity_threshold
+    
+    def _recognize_plate(self, roi_bgr, track_id, retry_count=0):
+        """
+        识别车牌（同步方法，在线程池中执行）
+        
+        Args:
+            roi_bgr: 车辆ROI（BGR格式）
+            track_id: 跟踪ID
+            retry_count: 当前重试次数
+            
+        Returns:
+            tuple: (plate_number, confidence) 或 (None, 0.0)
+        """
+        try:
+            # 图像预处理
+            min_height = 120
+            min_width = 320
+            if roi_bgr.shape[0] < min_height or roi_bgr.shape[1] < min_width:
+                scale = max(min_height / roi_bgr.shape[0], min_width / roi_bgr.shape[1])
+                new_width = int(roi_bgr.shape[1] * scale)
+                new_height = int(roi_bgr.shape[0] * scale)
+                roi_bgr = cv2.resize(roi_bgr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
+            max_height = 400
+            max_width = 1000
+            if roi_bgr.shape[0] > max_height or roi_bgr.shape[1] > max_width:
+                scale = min(max_height / roi_bgr.shape[0], max_width / roi_bgr.shape[1])
+                new_width = int(roi_bgr.shape[1] * scale)
+                new_height = int(roi_bgr.shape[0] * scale)
+                roi_bgr = cv2.resize(roi_bgr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
+            # 增强预处理
+            denoised = cv2.bilateralFilter(roi_bgr, 9, 75, 75)
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            sharpened = cv2.filter2D(denoised, -1, kernel)
+            lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced_bgr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+            
+            # 识别
+            results = self.lpr_detector(enhanced_bgr)
+            
+            if results and len(results) > 0:
+                plate = results[0]
+                # 处理不同的返回格式
+                if isinstance(plate, str):
+                    return plate, 1.0
+                elif hasattr(plate, 'code'):
+                    return plate.code, getattr(plate, 'confidence', 0.0)
+                elif isinstance(plate, dict):
+                    return plate.get('code', plate.get('plate', '')), plate.get('confidence', 0.0)
+                elif isinstance(plate, (list, tuple)) and len(plate) > 0:
+                    first_item = plate[0]
+                    if isinstance(first_item, str):
+                        return first_item, 1.0
+                    elif hasattr(first_item, 'code'):
+                        return first_item.code, 1.0
+                    else:
+                        return str(first_item), 1.0
+                else:
+                    return str(plate), 0.5
+            
+            return None, 0.0
+            
+        except Exception as e:
+            # 识别失败，如果还有重试次数，稍后重试
+            if retry_count < self.max_retries:
+                time.sleep(self.retry_delay)
+                return self._recognize_plate(roi_bgr, track_id, retry_count + 1)
+            return None, 0.0
+    
+    def submit_recognition(self, track_id, roi_bgr, class_name):
+        """
+        提交车牌识别任务
+        
+        Args:
+            track_id: 跟踪ID
+            roi_bgr: 车辆ROI（BGR格式）
+            class_name: 车辆类别名称
+            
+        Returns:
+            bool: 是否成功提交
+        """
+        # 仅对特定车型触发（car和truck）
+        if class_name not in ['car', 'truck']:
+            return False
+        
+        # 检查识别频率限制
+        current_time = time.time()
+        with self.lock:
+            if track_id in self.last_recognition_time:
+                elapsed = current_time - self.last_recognition_time[track_id]
+                if elapsed < self.min_recognition_interval:
+                    return False  # 频率限制
+            
+            # 检查是否已有待处理任务
+            if track_id in self.pending_tasks:
+                return False  # 已有待处理任务
+            
+            # 检查ROI质量
+            if not self._check_roi_quality(roi_bgr):
+                return False  # ROI质量不足
+            
+            # 提交任务
+            try:
+                future = self.executor.submit(self._recognize_plate, roi_bgr.copy(), track_id)
+                self.pending_tasks[track_id] = future
+                self.last_recognition_time[track_id] = current_time
+                return True
+            except Exception as e:
+                print(f"  ⚠ 提交LPR任务失败: {e}")
+                return False
+    
+    def get_result(self, track_id):
+        """
+        获取识别结果（非阻塞）
+        
+        Args:
+            track_id: 跟踪ID
+            
+        Returns:
+            tuple: (plate_number, confidence) 或 (None, None) 如果未完成
+        """
+        with self.lock:
+            if track_id not in self.pending_tasks:
+                # 检查是否有缓存结果
+                if track_id in self.recognition_results:
+                    return self.recognition_results[track_id]
+                return None, None
+            
+            future = self.pending_tasks[track_id]
+            if future.done():
+                try:
+                    plate_number, confidence = future.result()
+                    # 缓存结果
+                    self.recognition_results[track_id] = (plate_number, confidence)
+                    # 移除待处理任务
+                    del self.pending_tasks[track_id]
+                    return plate_number, confidence
+                except Exception as e:
+                    print(f"  ⚠ LPR任务执行失败: {e}")
+                    del self.pending_tasks[track_id]
+                    return None, None
+            else:
+                # 任务还在执行中
+                return None, None
+    
+    def shutdown(self):
+        """关闭处理器"""
+        self.executor.shutdown(wait=True)
+
+
+class MultiFrameValidator:
+    """多帧验证器：减少假阳性检测"""
+    
+    def __init__(self, min_frames=3, min_occurrence_ratio=0.7, validation_window=5, iou_threshold=0.5):
+        """
+        初始化多帧验证器
+        
+        Args:
+            min_frames: 最小连续帧数
+            min_occurrence_ratio: 最小出现频率
+            validation_window: 验证窗口大小（帧数）
+            iou_threshold: 帧间匹配的IoU阈值
+        """
+        self.min_frames = min_frames
+        self.min_occurrence_ratio = min_occurrence_ratio
+        self.validation_window = validation_window
+        self.iou_threshold = iou_threshold
+        
+        # 检测历史记录: {detection_id: {'class_id': int, 'bboxes': [box1, box2, ...], 'frame_ids': [fid1, fid2, ...]}}
+        self.detection_history = {}
+        self.next_detection_id = 0
+        self.frame_id = 0
+    
+    def _compute_iou(self, box1, box2):
+        """计算两个bbox的IoU"""
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0.0
+    
+    def _match_detection(self, box, class_id):
+        """
+        匹配当前检测框与历史检测
+        
+        Returns:
+            detection_id 或 None
+        """
+        best_match_id = None
+        best_iou = 0.0
+        
+        for det_id, history in self.detection_history.items():
+            # 检查类别是否匹配
+            if history['class_id'] != class_id:
+                continue
+            
+            # 获取最近的bbox（用于匹配）
+            if len(history['bboxes']) > 0:
+                last_bbox = history['bboxes'][-1]
+                iou = self._compute_iou(box, last_bbox)
+                
+                if iou > best_iou and iou >= self.iou_threshold:
+                    best_iou = iou
+                    best_match_id = det_id
+        
+        return best_match_id
+    
+    def validate_detections(self, boxes, class_ids, confidences):
+        """
+        验证检测框（连续帧判别）
+        
+        Args:
+            boxes: 检测框列表
+            class_ids: 类别ID列表
+            confidences: 置信度列表
+            
+        Returns:
+            tuple: (valid_boxes, valid_class_ids, valid_confidences)
+        """
+        if len(boxes) == 0:
+            self.frame_id += 1
+            # 清理过期历史
+            self._cleanup_history()
+            return boxes, class_ids, confidences
+        
+        # 匹配当前检测与历史检测
+        current_detection_ids = {}  # {box_index: detection_id}
+        
+        for i, (box, class_id) in enumerate(zip(boxes, class_ids)):
+            matched_id = self._match_detection(box, class_id)
+            
+            if matched_id is not None:
+                # 匹配到历史检测，更新历史
+                self.detection_history[matched_id]['bboxes'].append(box)
+                self.detection_history[matched_id]['frame_ids'].append(self.frame_id)
+                # 限制历史长度
+                if len(self.detection_history[matched_id]['bboxes']) > self.validation_window:
+                    self.detection_history[matched_id]['bboxes'].pop(0)
+                    self.detection_history[matched_id]['frame_ids'].pop(0)
+                current_detection_ids[i] = matched_id
+            else:
+                # 新检测，创建新的检测ID
+                new_id = self.next_detection_id
+                self.next_detection_id += 1
+                self.detection_history[new_id] = {
+                    'class_id': class_id,
+                    'bboxes': [box],
+                    'frame_ids': [self.frame_id]
+                }
+                current_detection_ids[i] = new_id
+        
+        # 清理过期历史
+        self._cleanup_history()
+        
+        # 验证检测框
+        valid_indices = []
+        for i, (box, class_id) in enumerate(zip(boxes, class_ids)):
+            if i not in current_detection_ids:
+                continue
+            
+            det_id = current_detection_ids[i]
+            history = self.detection_history.get(det_id)
+            
+            if history is None:
+                continue
+            
+            frame_ids = history['frame_ids']
+            
+            # 对于前几帧（系统刚启动），降低验证要求
+            if self.frame_id < self.min_frames:
+                # 系统刚启动，暂时允许所有检测通过（但记录历史）
+                valid_indices.append(i)
+            else:
+                # 正常验证流程
+                # 检查是否满足最小帧数要求
+                if len(frame_ids) >= self.min_frames:
+                    # 检查出现频率（在验证窗口内）
+                    recent_frames = [fid for fid in frame_ids if self.frame_id - fid < self.validation_window]
+                    if len(recent_frames) > 0:
+                        occurrence_ratio = len(recent_frames) / self.validation_window
+                        if occurrence_ratio >= self.min_occurrence_ratio:
+                            valid_indices.append(i)
+        
+        # 更新帧ID
+        self.frame_id += 1
+        
+        # 返回验证通过的检测
+        if len(valid_indices) > 0:
+            return boxes[valid_indices], class_ids[valid_indices], confidences[valid_indices]
+        else:
+            return np.array([]), np.array([]), np.array([])
+    
+    def _cleanup_history(self):
+        """清理过期历史记录"""
+        expired_frame = self.frame_id - self.validation_window
+        
+        for det_id in list(self.detection_history.keys()):
+            history = self.detection_history[det_id]
+            # 移除过期帧
+            valid_indices = [
+                i for i, fid in enumerate(history['frame_ids'])
+                if fid > expired_frame
+            ]
+            
+            if len(valid_indices) == 0:
+                # 所有帧都过期，删除历史
+                del self.detection_history[det_id]
+            else:
+                # 保留有效帧
+                history['bboxes'] = [history['bboxes'][i] for i in valid_indices]
+                history['frame_ids'] = [history['frame_ids'][i] for i in valid_indices]
+
+
+class TensorRTInference:
+    """TensorRT推理引擎"""
+    
+    def __init__(self, engine_path, conf_threshold=0.5, iou_threshold=0.4, labels_path=None):
+        """
+        加载TensorRT引擎
+        
+        Args:
+            engine_path: 引擎文件路径
+            conf_threshold: 检测置信度阈值
+            iou_threshold: NMS的IoU阈值
+            labels_path: 标签文件路径（可选，用于验证一致性）
+        """
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.labels_path = labels_path
+        
+        # 加载引擎
+        with open(engine_path, 'rb') as f:
+            runtime = trt.Runtime(self.logger)
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        
+        self.context = self.engine.create_execution_context()
+        
+        # 获取输入输出信息
+        self.input_shape = None
+        self.output_shape = None
+        self.bindings = []
+        
+        # 兼容TensorRT 8.x和10.x
+        if hasattr(self.engine, 'get_binding_name'):  # TensorRT 8.x
+            for i in range(self.engine.num_bindings):
+                name = self.engine.get_binding_name(i)
+                dtype = trt.nptype(self.engine.get_binding_dtype(i))
+                shape = self.engine.get_binding_shape(i)
+                
+                if self.engine.binding_is_input(i):
+                    self.input_shape = shape
+                else:
+                    self.output_shape = shape
+        else:  # TensorRT 10.x
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+                shape = self.engine.get_tensor_shape(name)
+                
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    self.input_shape = shape
+                else:
+                    self.output_shape = shape
+        
+        # 验证输出格式并确定类别数量
+        self.num_classes = self._validate_and_get_num_classes()
+        
+        # 验证与labels.txt的一致性（如果提供）
+        if labels_path:
+            self._validate_labels_consistency(labels_path)
+        
+        # 分配内存
+        self.input_buffer = cuda.mem_alloc(trt.volume(self.input_shape) * np.dtype(np.float32).itemsize)
+        self.output_buffer = cuda.mem_alloc(trt.volume(self.output_shape) * np.dtype(np.float32).itemsize)
+        
+        self.stream = cuda.Stream()
+        
+        print(f"✓ TensorRT引擎加载成功")
+        print(f"  输入shape: {self.input_shape}")
+        print(f"  输出shape: {self.output_shape}")
+        print(f"  类别数量: {self.num_classes}")
+    
+    def _validate_and_get_num_classes(self):
+        """
+        验证输出格式并确定类别数量
+        
+        Returns:
+            类别数量
+            
+        Raises:
+            ValueError: 如果输出格式不符合预期
+        """
+        if self.output_shape is None:
+            raise ValueError("无法获取输出shape，引擎可能损坏")
+        
+        # YOLO输出格式: [batch, channels, num_anchors]
+        # 或 [batch, num_anchors, channels]
+        # channels = 4 (bbox: x, y, w, h) + 1 (confidence) + num_classes
+        
+        if len(self.output_shape) != 3:
+            raise ValueError(
+                f"输出shape维度错误: 期望3维 [batch, channels, anchors] 或 [batch, anchors, channels], "
+                f"实际得到 {len(self.output_shape)}维: {self.output_shape}"
+            )
+        
+        batch_size, dim1, dim2 = self.output_shape
+        
+        # 判断格式: [batch, channels, anchors] 或 [batch, anchors, channels]
+        # 通常YOLO是 [batch, channels, anchors]，其中channels = 5 + num_classes
+        if dim1 < dim2:
+            # 可能是 [batch, channels, anchors]，channels较小
+            channels = dim1
+            num_anchors = dim2
+        else:
+            # 可能是 [batch, anchors, channels]，channels较大
+            channels = dim2
+            num_anchors = dim1
+        
+        # 验证channels格式: 应该是 5 + num_classes
+        # 5 = 4(bbox) + 1(conf) 或 4(bbox) + num_classes(直接输出类别分数)
+        # YOLOv11通常是: 4(bbox) + num_classes
+        if channels < 5:
+            raise ValueError(
+                f"输出channels数量错误: 期望至少5 (4 bbox + 1 conf 或 4 bbox + classes), "
+                f"实际得到 {channels}"
+            )
+        
+        # YOLOv11格式: channels = 4 + num_classes (没有单独的confidence)
+        # 或者 channels = 5 + num_classes (有单独的confidence)
+        # 通常YOLOv11是 4 + num_classes
+        if channels == 4:
+            raise ValueError(
+                "输出channels为4，缺少类别信息。期望格式: channels = 4 + num_classes"
+            )
+        
+        # 计算类别数量
+        # 如果channels = 5 + num_classes，则num_classes = channels - 5
+        # 如果channels = 4 + num_classes，则num_classes = channels - 4
+        # 尝试两种格式
+        num_classes_v1 = channels - 5  # 格式: 4 bbox + 1 conf + num_classes
+        num_classes_v2 = channels - 4  # 格式: 4 bbox + num_classes (YOLOv11)
+        
+        # 选择合理的类别数量（通常类别数 > 0 且 < 1000）
+        if num_classes_v2 > 0 and num_classes_v2 < 1000:
+            num_classes = num_classes_v2
+            self.output_format = 'yolov11'  # 4 bbox + num_classes
+        elif num_classes_v1 > 0 and num_classes_v1 < 1000:
+            num_classes = num_classes_v1
+            self.output_format = 'yolo_standard'  # 4 bbox + 1 conf + num_classes
+        else:
+            raise ValueError(
+                f"无法确定类别数量: channels={channels}, "
+                f"计算得到 num_classes_v1={num_classes_v1}, num_classes_v2={num_classes_v2}, "
+                f"都不合理（应在1-1000之间）"
+            )
+        
+        print(f"  ✓ 输出格式验证通过: {self.output_format}")
+        print(f"  ✓ 检测到 {num_classes} 个类别")
+        
+        return num_classes
+    
+    def _validate_labels_consistency(self, labels_path):
+        """
+        验证labels.txt与引擎输出的一致性
+        
+        Args:
+            labels_path: 标签文件路径
+            
+        Raises:
+            ValueError: 如果不一致
+        """
+        if not os.path.exists(labels_path):
+            print(f"  ⚠ labels.txt不存在: {labels_path}，跳过一致性验证")
+            return
+        
+        # 读取labels.txt
+        try:
+            with open(labels_path, 'r', encoding='utf-8') as f:
+                labels = [line.strip() for line in f if line.strip()]
+            
+            num_labels = len(labels)
+            
+            if num_labels != self.num_classes:
+                raise ValueError(
+                    f"类别数量不一致！\n"
+                    f"  引擎输出: {self.num_classes} 个类别\n"
+                    f"  labels.txt: {num_labels} 个类别\n"
+                    f"  请检查模型和标签文件是否匹配"
+                )
+            
+            print(f"  ✓ labels.txt验证通过: {num_labels} 个类别")
+            print(f"    类别列表: {', '.join(labels[:5])}{'...' if len(labels) > 5 else ''}")
+            
+            # 更新CUSTOM_CLASSES映射（如果可能）
+            self.labels = labels
+            
+        except Exception as e:
+            print(f"  ⚠ 读取labels.txt失败: {e}")
+            self.labels = None
+    
+    def preprocess(self, image):
+        """预处理图像"""
+        # Resize
+        input_h, input_w = self.input_shape[2], self.input_shape[3]
+        resized = cv2.resize(image, (input_w, input_h))
+        
+        # 归一化到[0,1]
+        input_data = resized.astype(np.float32) / 255.0
+        
+        # HWC -> CHW
+        input_data = np.transpose(input_data, (2, 0, 1))
+        
+        # 添加batch维度
+        input_data = np.expand_dims(input_data, axis=0)
+        
+        return np.ascontiguousarray(input_data)
+    
+    def infer(self, input_data):
+        """执行推理"""
+        # 复制输入数据到GPU
+        cuda.memcpy_htod_async(self.input_buffer, input_data, self.stream)
+        
+        # 执行推理
+        if hasattr(self.context, 'execute_async_v2'):  # TensorRT 8.x
+            self.context.execute_async_v2(
+                bindings=[int(self.input_buffer), int(self.output_buffer)],
+                stream_handle=self.stream.handle
+            )
+        else:  # TensorRT 10.x
+            self.context.set_tensor_address(self.engine.get_tensor_name(0), int(self.input_buffer))
+            self.context.set_tensor_address(self.engine.get_tensor_name(1), int(self.output_buffer))
+            self.context.execute_async_v3(stream_handle=self.stream.handle)
+        
+        # 复制输出数据到CPU
+        output = np.empty(self.output_shape, dtype=np.float32)
+        cuda.memcpy_dtoh_async(output, self.output_buffer, self.stream)
+        self.stream.synchronize()
+        
+        return output
+    
+    def postprocess(self, output):
+        """后处理：NMS（使用初始化时的阈值）"""
+        conf_threshold = self.conf_threshold
+        iou_threshold = self.iou_threshold
+        
+        # 动态解析输出格式
+        # YOLOv11格式: [batch, channels, anchors] 或 [batch, anchors, channels]
+        # channels = 4 (bbox) + num_classes
+        
+        predictions = output[0]  # 移除batch维度
+        
+        # 判断格式并转置
+        if self.output_format == 'yolov11':
+            # 格式: [channels, anchors] 或 [anchors, channels]
+            # 需要转置为 [anchors, channels]
+            if predictions.shape[0] < predictions.shape[1]:
+                # [channels, anchors] -> [anchors, channels]
+                predictions = predictions.T
+            # 现在predictions是 [anchors, channels]
+            boxes = predictions[:, :4]  # [x_center, y_center, w, h]
+            scores = predictions[:, 4:4+self.num_classes]  # [num_classes]
+        else:  # yolo_standard
+            # 格式: [channels, anchors] 或 [anchors, channels]
+            # channels = 4 (bbox) + 1 (conf) + num_classes
+            if predictions.shape[0] < predictions.shape[1]:
+                predictions = predictions.T
+            boxes = predictions[:, :4]  # [x_center, y_center, w, h]
+            objectness = predictions[:, 4:5]  # [1] confidence
+            class_scores = predictions[:, 5:5+self.num_classes]  # [num_classes]
+            # 综合confidence = objectness * max(class_score)
+            scores = objectness * class_scores
+        
+        # 获取最大类别得分
+        class_ids = np.argmax(scores, axis=1)
+        confidences = np.max(scores, axis=1)
+        
+        # 过滤低置信度
+        mask = confidences > conf_threshold
+        boxes = boxes[mask]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+        
+        # 转换bbox格式: center -> corner
+        x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = x_center - w / 2
+        y1 = y_center - h / 2
+        x2 = x_center + w / 2
+        y2 = y_center + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+        
+        # NMS（使用更严格的IoU阈值，减少重复检测）
+        indices = cv2.dnn.NMSBoxes(
+            boxes.tolist(),
+            confidences.tolist(),
+            conf_threshold,
+            iou_threshold
+        )
+        
+        if len(indices) > 0:
+            indices = indices.flatten()
+            filtered_boxes = boxes[indices]
+            filtered_confidences = confidences[indices]
+            filtered_class_ids = class_ids[indices]
+            
+            # 额外的IoU过滤：对于静态图片，NMS可能不够严格
+            # 如果两个检测框的IoU很高，只保留置信度更高的那个
+            if len(filtered_boxes) > 1:
+                # 按置信度降序排序，优先保留高置信度的检测
+                sorted_indices = np.argsort(filtered_confidences)[::-1]
+                keep_indices = []
+                
+                for i in sorted_indices:
+                    keep = True
+                    box_i = filtered_boxes[i]
+                    x1_i, y1_i, x2_i, y2_i = box_i
+                    area_i = (x2_i - x1_i) * (y2_i - y1_i)
+                    
+                    # 检查是否与已保留的框重叠
+                    for j in keep_indices:
+                        box_j = filtered_boxes[j]
+                        x1_j, y1_j, x2_j, y2_j = box_j
+                        
+                        # 计算IoU
+                        inter_x1 = max(x1_i, x1_j)
+                        inter_y1 = max(y1_i, y1_j)
+                        inter_x2 = min(x2_i, x2_j)
+                        inter_y2 = min(y2_i, y2_j)
+                        
+                        if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                            area_j = (x2_j - x1_j) * (y2_j - y1_j)
+                            union_area = area_i + area_j - inter_area
+                            
+                            if union_area > 0:
+                                iou = inter_area / union_area
+                                # 如果IoU很高，则丢弃当前框（因为已保留的框置信度更高）
+                                if iou > 0.7:  # 更严格的IoU阈值
+                                    keep = False
+                                    break
+                    
+                    if keep:
+                        keep_indices.append(i)
+                
+                # 按原始顺序排序
+                keep_indices = sorted(keep_indices)
+                
+                if len(keep_indices) < len(filtered_boxes):
+                    filtered_boxes = filtered_boxes[keep_indices]
+                    filtered_confidences = filtered_confidences[keep_indices]
+                    filtered_class_ids = filtered_class_ids[keep_indices]
+            
+            return filtered_boxes, filtered_confidences, filtered_class_ids
+        
+        return np.array([]), np.array([]), np.array([])
+
+
+class VehicleTracker:
+    """车辆跟踪器"""
+    
+    def __init__(self, iou_threshold=0.3, max_age=30):
+        """
+        初始化跟踪器
+        
+        Args:
+            iou_threshold: 跟踪匹配的IoU阈值
+            max_age: 跟踪消失的最大帧数
+        """
+        self.iou_threshold = iou_threshold
+        self.tracks = {}  # {track_id: {'bbox': ..., 'class': ..., 'last_seen': ..., 'processed': False, 'class_history': [...]}}
+        self.next_id = 1
+        self.max_age = max_age
+    
+    def compute_iou(self, box1, box2):
+        """计算IoU"""
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0.0
+    
+    def update(self, boxes, class_ids, frame_id, confidences=None):
+        """更新跟踪（支持类别稳定性和置信度）"""
+        current_tracks = {}
+        matched = set()
+        new_detections = []
+        
+        # 如果没有提供置信度，创建默认数组
+        if confidences is None:
+            confidences = [0.0] * len(boxes)
+        elif isinstance(confidences, np.ndarray):
+            confidences = confidences.tolist()
+        
+        # 匹配现有tracks（允许不同类别匹配，但优先相同类别）
+        for i, (box, class_id) in enumerate(zip(boxes, class_ids)):
+            confidence = confidences[i] if i < len(confidences) else 0.0
+            best_iou = 0
+            best_track_id = None
+            best_same_class = False
+            
+            for track_id, track in self.tracks.items():
+                iou = self.compute_iou(box, track['bbox'])
+                if iou > best_iou and iou > self.iou_threshold:
+                    same_class = (track['class'] == class_id)
+                    # 优先匹配相同类别，但如果IoU足够高也允许不同类别（可能是误检）
+                    if same_class or (iou > self.iou_threshold * 1.5):  # 不同类别需要更高的IoU
+                        best_iou = iou
+                        best_track_id = track_id
+                        best_same_class = same_class
+            
+            if best_track_id is not None:
+                track = self.tracks[best_track_id]
+                # 更新类别历史（保留最近10帧）
+                if 'class_history' not in track:
+                    track['class_history'] = []
+                track['class_history'].append(class_id)
+                if len(track['class_history']) > 10:
+                    track['class_history'].pop(0)
+                
+                # 更新置信度历史（保留最近10帧，使用最高置信度）
+                if 'confidence_history' not in track:
+                    track['confidence_history'] = []
+                track['confidence_history'].append(confidence)
+                if len(track['confidence_history']) > 10:
+                    track['confidence_history'].pop(0)
+                
+                # 使用稳定的类别（多数投票）
+                stable_class = self._get_stable_class(track.get('class_history', [class_id]))
+                # 使用最高置信度（最近10帧中的最大值）
+                stable_confidence = max(track.get('confidence_history', [confidence]))
+                
+                current_tracks[best_track_id] = {
+                    'bbox': box,
+                    'class': stable_class,  # 使用稳定类别
+                    'confidence': stable_confidence,  # 使用最高置信度
+                    'last_seen': frame_id,
+                    'processed': track['processed'],
+                    'class_history': track['class_history'],
+                    'confidence_history': track['confidence_history']
+                }
+                matched.add(i)
+            else:
+                new_detections.append((box, class_id, confidence))
+        
+        # 创建新tracks
+        for item in new_detections:
+            if len(item) == 3:
+                box, class_id, confidence = item
+            else:
+                box, class_id = item
+                confidence = 0.0
+            current_tracks[self.next_id] = {
+                'bbox': box,
+                'class': class_id,
+                'confidence': confidence,  # 保存检测置信度
+                'last_seen': frame_id,
+                'processed': False,  # 新车辆，未处理
+                'class_history': [class_id],  # 初始化类别历史
+                'confidence_history': [confidence]  # 初始化置信度历史
+            }
+            self.next_id += 1
+        
+        # 保留最近见过的tracks
+        for track_id, track in self.tracks.items():
+            if track_id not in current_tracks and frame_id - track['last_seen'] < self.max_age:
+                current_tracks[track_id] = track
+        
+        self.tracks = current_tracks
+        return self.tracks
+    
+    def _get_stable_class(self, class_history):
+        """从类别历史中获取最稳定的类别（多数投票）"""
+        if not class_history:
+            return None
+        from collections import Counter
+        counter = Counter(class_history)
+        # 返回出现次数最多的类别
+        return counter.most_common(1)[0][0]
+
+
+class RealtimeVehicleDetection:
+    """实时车辆检测系统"""
+    
+    def __init__(self, config_path=None, engine_path=None, cassia_router_ip=None, 
+                 use_depth=True, camera_id=None, no_display=False):
+        """
+        初始化
+        
+        Args:
+            config_path: 配置文件路径（如果为None则使用默认路径）
+            engine_path: 模型路径（如果为None则从配置文件读取）
+            cassia_router_ip: Cassia IP（如果为None则从配置文件读取）
+            use_depth: 是否使用深度相机
+            camera_id: 摄像头ID（如果为None则从配置文件读取）
+            no_display: 是否禁用显示（无头模式）
+        """
+        # 加载配置
+        self.config = get_config(config_path)
+        
+        # 从配置文件或参数获取值（参数优先）
+        detection_cfg = self.config.get_detection()
+        network_cfg = self.config.get_network()
+        tracking_cfg = self.config.get_tracking()
+        paths_cfg = self.config.get_paths()
+        depth_cfg = self.config.get_depth()
+        
+        self.engine_path = engine_path or self.config.resolve_path('detection.model_path')
+        self.cassia_router_ip = cassia_router_ip or network_cfg['cassia_ip']
+        self.camera_id = camera_id or network_cfg['camera_id']
+        self.use_depth = use_depth
+        self.no_display = no_display
+        
+        print("="*70)
+        print("实时车辆检测系统初始化")
+        print("="*70)
+        print(f"配置文件: {self.config.config_path}")
+        print(f"模型路径: {self.engine_path}")
+        print(f"Cassia IP: {self.cassia_router_ip}")
+        print(f"摄像头ID: {self.camera_id}")
+        
+        # TensorRT推理
+        print("\n【1. 加载TensorRT引擎】")
+        # 查找labels.txt路径
+        labels_path = None
+        config_dir = os.path.dirname(self.config.config_path) if hasattr(self.config, 'config_path') else '.'
+        possible_labels_paths = [
+            os.path.join(config_dir, 'config', 'labels.txt'),
+            os.path.join(os.path.dirname(self.engine_path), '..', 'config', 'labels.txt'),
+            'config/labels.txt'
+        ]
+        for path in possible_labels_paths:
+            if os.path.exists(path):
+                labels_path = path
+                break
+        
+        self.inference = TensorRTInference(
+            self.engine_path,
+            conf_threshold=detection_cfg['conf_threshold'],
+            iou_threshold=detection_cfg['iou_threshold'],
+            labels_path=labels_path
+        )
+        
+        # 更新CUSTOM_CLASSES映射（如果labels.txt存在且已加载）
+        if hasattr(self.inference, 'labels') and self.inference.labels:
+            global CUSTOM_CLASSES
+            CUSTOM_CLASSES = {i: label for i, label in enumerate(self.inference.labels)}
+            print(f"  ✓ 已更新类别映射: {len(CUSTOM_CLASSES)} 个类别")
+        
+        # 车辆跟踪
+        print("\n【2. 初始化跟踪器】")
+        tracker_type = tracking_cfg.get('tracker_type', 'simple_iou')
+        if tracker_type == 'bytetrack':
+            self.tracker = ByteTracker(
+                track_thresh=tracking_cfg.get('track_thresh', 0.5),
+                high_thresh=tracking_cfg.get('high_thresh', 0.6),
+                match_thresh=tracking_cfg.get('match_thresh', 0.8),
+                track_buffer=tracking_cfg.get('track_buffer', 30)
+            )
+            print(f"✓ ByteTrack跟踪器初始化完成")
+            print(f"  跟踪阈值: {tracking_cfg.get('track_thresh', 0.5)}")
+            print(f"  高置信度阈值: {tracking_cfg.get('high_thresh', 0.6)}")
+            print(f"  匹配阈值: {tracking_cfg.get('match_thresh', 0.8)}")
+        else:
+            self.tracker = VehicleTracker(
+                iou_threshold=tracking_cfg['iou_threshold'],
+                max_age=tracking_cfg['max_age']
+            )
+            print(f"✓ Simple IoU跟踪器初始化完成")
+        self.tracker_type = tracker_type
+        
+        # Cassia蓝牙客户端
+        print("\n【3. 连接Cassia蓝牙路由器】")
+        try:
+            self.beacon_client = CassiaLocalClient(self.cassia_router_ip)
+            self.beacon_client.start()  # 正确的方法名
+            print(f"✓ Cassia客户端启动成功: {self.cassia_router_ip}")
+            
+            # 等待Cassia建立连接并开始扫描
+            print("  等待Cassia建立连接...")
+            import time
+            time.sleep(3)  # 等待3秒让Cassia开始扫描
+            
+            # 检查是否已经开始扫描到信标
+            initial_beacons = self.beacon_client.get_beacons()
+            print(f"  初始扫描到 {len(initial_beacons)} 个信标")
+            if len(initial_beacons) == 0:
+                print("  ⚠ 暂未扫描到信标，可能需要更多时间建立连接")
+            
+        except Exception as e:
+            print(f"⚠ Cassia客户端启动失败: {e}")
+            self.beacon_client = None
+        
+        # 信标智能过滤器
+        print("\n【4. 初始化信标过滤器】")
+        beacon_whitelist_path = self.config.resolve_path('paths.beacon_whitelist')
+        
+        # 初始化云端白名单管理器（如果云端功能启用）
+        cloud_whitelist_manager = None
+        if CLOUD_AVAILABLE:
+            try:
+                cloud_cfg = self.config.get_cloud()
+                if cloud_cfg.get('enabled', False) and cloud_cfg.get('enable_cloud_whitelist', True):
+                    # 注意：目录名是 jetson-client，但导入时使用 jetson_client（Python模块名不能有连字符）
+                    import sys
+                    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'jetson-client'))
+                    from beacon_whitelist import BeaconWhitelistManager
+                    cloud_whitelist_manager = BeaconWhitelistManager(
+                        api_base_url=cloud_cfg.get('api_base_url', 'http://your-server-ip:8000'),
+                        api_key=cloud_cfg.get('api_key', 'your-api-key-here'),
+                        update_interval=cloud_cfg.get('beacon_whitelist_update_interval', 300)  # 默认5分钟
+                    )
+                    # 启动时立即获取一次白名单
+                    if cloud_whitelist_manager.fetch_whitelist():
+                        print(f"  ✅ 云端白名单管理器初始化成功")
+                    else:
+                        print(f"  ⚠️  云端白名单获取失败，将使用本地配置")
+                        cloud_whitelist_manager = None
+            except ImportError as e:
+                print(f"  ⚠️  无法导入云端白名单模块: {e}，将使用本地配置")
+                cloud_whitelist_manager = None
+            except Exception as e:
+                print(f"  ⚠️  云端白名单管理器初始化失败: {e}，将使用本地配置")
+                cloud_whitelist_manager = None
+        
+        # 初始化信标过滤器（优先使用云端白名单）
+        try:
+            self.beacon_filter = BeaconFilter(
+                beacon_whitelist_path, 
+                camera_id=self.camera_id,
+                cloud_whitelist_manager=cloud_whitelist_manager
+            )
+            # 保存云端白名单管理器引用（用于定时更新）
+            self.cloud_whitelist_manager = cloud_whitelist_manager
+        except Exception as e:
+            print(f"⚠ 信标过滤器初始化失败: {e}")
+            self.beacon_filter = None
+            self.cloud_whitelist_manager = None
+        
+        # Orbbec深度相机
+        print("\n【5. 初始化Orbbec相机】")
+        if use_depth:
+            try:
+                # 从配置读取无效深度值范围
+                invalid_min = depth_cfg.get('invalid_min', 0)
+                invalid_max = depth_cfg.get('invalid_max', 65535)
+                self.depth_camera = OrbbecDepthCamera(
+                    invalid_min=invalid_min,
+                    invalid_max=invalid_max
+                )
+                self.depth_camera.start()
+                print("✓ Orbbec相机启动成功")
+            except Exception as e:
+                print(f"⚠ Orbbec相机启动失败: {e}")
+                self.depth_camera = None
+        else:
+            self.depth_camera = None
+            print("ℹ 深度相机已禁用")
+        
+        # HyperLPR
+        print("\n【6. 初始化车牌识别】")
+        if LPR_AVAILABLE:
+            # LicensePlateCatcher(inference=0, folder, detect_level=0, logger_level=3)
+            # inference: 0=ONNX Runtime, 1=MNN
+            # detect_level: 0=LOW (快速), 1=HIGH (精确)
+            # 注意: 当前使用CPU推理，GPU资源专注于YOLOv11
+            self.lpr_detector = lpr3.LicensePlateCatcher(
+                inference=lpr3.INFER_ONNX_RUNTIME,
+                detect_level=lpr3.DETECT_LEVEL_LOW
+            )
+            print("✓ HyperLPR初始化成功 (CPU推理)")
+            
+            # 初始化异步LPR处理器
+            self.async_lpr = AsyncLPRProcessor(
+                self.lpr_detector,
+                max_workers=2,
+                max_queue_size=10
+            )
+            print("✓ 异步LPR处理器初始化成功")
+        else:
+            self.lpr_detector = None
+            self.async_lpr = None
+        
+        # 加载中文字体
+        display_cfg = self.config.get_display()
+        try:
+            font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+            self.font = ImageFont.truetype(font_path, display_cfg['font_size_large'])
+            self.font_small = ImageFont.truetype(font_path, display_cfg['font_size_small'])
+        except:
+            self.font = ImageFont.load_default()
+            self.font_small = ImageFont.load_default()
+        
+        # 统计
+        self.frame_count = 0
+        self.fps = 0
+        self.alerts = []  # 报警记录
+        
+        # 检测结果数据库（可选）
+        self.detection_db = None
+        db_path = paths_cfg.get('detection_db_path', 'detection_results.db')
+        if db_path:
+            try:
+                from python_apps.detection_database import DetectionDatabase
+                self.detection_db = DetectionDatabase(db_path)
+                print("\n【9. 初始化检测结果数据库】")
+                print(f"✓ 数据库初始化完成: {db_path}")
+            except Exception as e:
+                print(f"\n【9. 检测结果数据库】")
+                print(f"⚠ 数据库初始化失败: {e}")
+                self.detection_db = None
+        
+        # 帧共享（用于录制脚本）
+        self.shared_frame_file = paths_cfg['shared_frame_file']
+        self.shared_depth_file = paths_cfg['shared_depth_file']
+        self.enable_frame_sharing = True  # 是否启用帧共享
+        
+        # 深度测量配置
+        self.depth_config = depth_cfg
+        
+        # 多帧验证器（减少假阳性）
+        multi_frame_cfg = detection_cfg.get('multi_frame_validation', {})
+        if multi_frame_cfg.get('enabled', True):
+            self.multi_frame_validator = MultiFrameValidator(
+                min_frames=multi_frame_cfg.get('min_frames', 3),
+                min_occurrence_ratio=multi_frame_cfg.get('min_occurrence_ratio', 0.7),
+                validation_window=multi_frame_cfg.get('validation_window', 5),
+                iou_threshold=multi_frame_cfg.get('iou_threshold', 0.5)
+            )
+            print("\n【7. 初始化多帧验证器】")
+            print(f"✓ 多帧验证器初始化完成")
+            print(f"  最小帧数: {multi_frame_cfg.get('min_frames', 3)}")
+            print(f"  最小出现频率: {multi_frame_cfg.get('min_occurrence_ratio', 0.7)}")
+            print(f"  验证窗口: {multi_frame_cfg.get('validation_window', 5)} 帧")
+        else:
+            self.multi_frame_validator = None
+            print("\n【7. 多帧验证器】")
+            print("ℹ 多帧验证已禁用")
+        
+        # 云端集成（可选）
+        print("\n【8. 初始化云端集成】")
+        self.cloud_integration = None
+        self.snapshot_dir = paths_cfg.get('snapshot_dir', '/tmp/vehicle_snapshots')
+        if CLOUD_AVAILABLE:
+            cloud_cfg = self.config.get_cloud()
+            if cloud_cfg.get('enabled', False):
+                try:
+                    cloud_config = CloudConfig(
+                        api_base_url=cloud_cfg.get('api_base_url', 'http://your-server-ip:8000'),
+                        api_key=cloud_cfg.get('api_key', 'your-api-key-here'),
+                        upload_interval=cloud_cfg.get('upload_interval', 10),
+                        max_image_size_mb=cloud_cfg.get('max_image_size_mb', 5),
+                        enable_image_upload=cloud_cfg.get('enable_image_upload', True),
+                        enable_alert_upload=cloud_cfg.get('enable_alert_upload', True),
+                        retry_attempts=cloud_cfg.get('retry_attempts', 3),
+                        retry_delay=cloud_cfg.get('retry_delay', 2.0)
+                    )
+                    self.cloud_integration = SentinelIntegration(cloud_config)
+                    
+                    # 设置统计信息回调函数（延迟到run方法中设置，因为tracks在运行时才存在）
+                    # 这里先创建一个基础回调，在run方法中会更新
+                    def get_stats():
+                        return {
+                            'frame_count': self.frame_count,
+                            'fps': self.fps,
+                            'total_alerts': len(self.alerts),
+                            'queue_size': self.cloud_integration.get_queue_size() if self.cloud_integration else 0
+                        }
+                    self.cloud_integration.set_stats_callback(get_stats)
+                    self._stats_callback_initialized = True
+                    
+                    self.cloud_integration.start()
+                    
+                    # 创建快照目录
+                    os.makedirs(self.snapshot_dir, exist_ok=True)
+                    
+                    # 健康检查
+                    if self.cloud_integration.health_check():
+                        print(f"✓ 云端集成启动成功")
+                        print(f"  服务器: {cloud_config.api_base_url}")
+                        print(f"  快照目录: {self.snapshot_dir}")
+                        print(f"  心跳间隔: {self.cloud_integration.heartbeat_interval} 秒")
+                    else:
+                        print(f"⚠ 云端服务器连接失败，但将继续尝试上传")
+                except Exception as e:
+                    print(f"⚠ 云端集成启动失败: {e}")
+                    self.cloud_integration = None
+            else:
+                print("ℹ 云端上传已禁用（config.yaml中cloud.enabled=false）")
+        else:
+            print("ℹ 云端集成模块不可用")
+        
+        # 硬件恢复管理器
+        print("\n【10. 初始化硬件恢复管理器】")
+        recovery_cfg = self.config.get_recovery()
+        
+        # 定义Cassia恢复函数（供硬件恢复和网络恢复使用）
+        def cassia_recovery_func():
+            if self.beacon_client is None:
+                return False
+            try:
+                # 停止当前客户端
+                self.beacon_client.stop()
+                time.sleep(1)
+                # 重新初始化
+                self.beacon_client = CassiaLocalClient(self.cassia_router_ip)
+                self.beacon_client.start()
+                time.sleep(3)  # 等待建立连接
+                # 验证恢复是否成功
+                test_beacons = self.beacon_client.get_beacons()
+                return test_beacons is not None
+            except Exception as e:
+                print(f"[硬件恢复] Cassia恢复异常: {e}")
+                return False
+        
+        if recovery_cfg.get('camera_retry_enabled', True) or recovery_cfg.get('cassia_retry_enabled', True):
+            # 定义相机恢复函数
+            def camera_recovery_func():
+                if self.depth_camera is None:
+                    return False
+                try:
+                    # 停止当前相机
+                    self.depth_camera.stop()
+                    time.sleep(1)
+                    # 重新初始化
+                    invalid_min = depth_cfg.get('invalid_min', 0)
+                    invalid_max = depth_cfg.get('invalid_max', 65535)
+                    self.depth_camera = OrbbecDepthCamera(
+                        invalid_min=invalid_min,
+                        invalid_max=invalid_max
+                    )
+                    self.depth_camera.start()
+                    # 验证恢复是否成功
+                    test_frame = self.depth_camera.get_color_frame()
+                    return test_frame is not None
+                except Exception as e:
+                    print(f"[硬件恢复] 相机恢复异常: {e}")
+                    return False
+            
+            self.hardware_recovery = HardwareRecovery(
+                camera_recovery=camera_recovery_func if recovery_cfg.get('camera_retry_enabled', True) else None,
+                cassia_recovery=cassia_recovery_func if recovery_cfg.get('cassia_retry_enabled', True) else None,
+                camera_retry_interval=recovery_cfg.get('camera_retry_interval', 5.0),
+                cassia_retry_interval=recovery_cfg.get('cassia_retry_interval', 3.0),
+                camera_max_retries=recovery_cfg.get('camera_max_retries', 10),
+                cassia_max_retries=recovery_cfg.get('cassia_max_retries', 10),
+                graceful_degradation=recovery_cfg.get('graceful_degradation', True)
+            )
+            print("✓ 硬件恢复管理器初始化完成")
+        else:
+            self.hardware_recovery = None
+            print("ℹ 硬件恢复已禁用")
+        
+        # 网络恢复管理器
+        print("\n【11. 初始化网络恢复管理器】")
+        self.network_recovery = NetworkRecovery(
+            cassia_ip=self.cassia_router_ip,
+            cassia_recovery=cassia_recovery_func,
+            check_interval=30.0,
+            retry_interval=5.0,
+            max_retries=10
+        )
+        print("✓ 网络恢复管理器初始化完成")
+        
+        print("\n" + "="*70)
+        print("✓ 系统初始化完成！")
+        print("="*70)
+    
+    def _save_snapshot_and_upload(self, alert: dict, frame: np.ndarray, bbox: tuple) -> None:
+        """
+        保存快照并上传到云端
+        
+        Args:
+            alert: 警报字典
+            frame: 原始帧（RGB格式，来自Orbbec相机）
+            bbox: 边界框 (x1, y1, x2, y2)
+        """
+        if not self.cloud_integration:
+            return
+        
+        try:
+            # 保存快照
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            snapshot_path = os.path.join(
+                self.snapshot_dir,
+                f"snapshot_{alert.get('track_id', 'unknown')}_{timestamp}.jpg"
+            )
+            
+            # 裁剪车辆区域（带边界扩展）
+            x1, y1, x2, y2 = bbox
+            h, w = frame.shape[:2]
+            # 扩展边界（20%，增加更多上下文）
+            margin_x = int((x2 - x1) * 0.2)
+            margin_y = int((y2 - y1) * 0.2)
+            x1 = max(0, int(x1) - margin_x)
+            y1 = max(0, int(y1) - margin_y)
+            x2 = min(w, int(x2) + margin_x)
+            y2 = min(h, int(y2) + margin_y)
+            
+            # 裁剪快照区域
+            snapshot = frame[y1:y2, x1:x2].copy()
+            
+            # 确保最小分辨率（至少640x480，提高前端显示质量）
+            min_width, min_height = 640, 480
+            if snapshot.shape[0] < min_height or snapshot.shape[1] < min_width:
+                # 如果裁剪区域太小，按比例放大到最小尺寸
+                scale = max(min_width / snapshot.shape[1], min_height / snapshot.shape[0])
+                new_width = int(snapshot.shape[1] * scale)
+                new_height = int(snapshot.shape[0] * scale)
+                snapshot = cv2.resize(snapshot, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
+            # 确保最大分辨率（不超过2560，保持宽高比，支持更高分辨率）
+            max_dimension = 2560
+            if snapshot.shape[0] > max_dimension or snapshot.shape[1] > max_dimension:
+                scale = min(max_dimension / snapshot.shape[1], max_dimension / snapshot.shape[0])
+                new_width = int(snapshot.shape[1] * scale)
+                new_height = int(snapshot.shape[0] * scale)
+                snapshot = cv2.resize(snapshot, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+            
+            # frame来自Orbbec相机，始终是RGB格式，需要转换为BGR保存（OpenCV imwrite需要BGR）
+            if len(snapshot.shape) == 3 and snapshot.shape[2] == 3:
+                # RGB -> BGR
+                snapshot_bgr = cv2.cvtColor(snapshot, cv2.COLOR_RGB2BGR)
+                # 使用高质量JPEG保存（quality=95）
+                cv2.imwrite(snapshot_path, snapshot_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            else:
+                # 灰度图或其他格式，直接保存
+                cv2.imwrite(snapshot_path, snapshot)
+            
+            # 创建检测结果并上传
+            detection_result = DetectionResult(
+                vehicle_type=alert.get('type', 'Unknown'),
+                detected_class=alert.get('detected_type') or alert.get('detected_class'),
+                status=alert.get('status'),
+                confidence=alert.get('confidence', 0.0),
+                plate_number=alert.get('plate_number') or alert.get('plate'),
+                timestamp=datetime.now(),
+                image_path=snapshot_path,
+                bbox=bbox,
+                track_id=alert.get('track_id'),
+                distance=alert.get('distance'),
+                is_registered=(alert.get('status') == 'registered'),
+                beacon_mac=alert.get('beacon_mac'),
+                company=alert.get('company'),
+                environment_code=alert.get('environment_code'),  # 添加环境编码
+                metadata={
+                    'rssi': alert.get('rssi'),
+                    'match_cost': alert.get('match_cost')
+                } if alert.get('rssi') is not None or alert.get('match_cost') is not None else None
+            )
+            
+            self.cloud_integration.on_detection(detection_result)
+            
+        except Exception as e:
+            print(f"⚠ 保存快照或上传失败: {e}")
+    
+    def process_new_vehicle(self, track_id, vehicle_type, bbox, image, class_name=None, detection_confidence=0.0):
+        """处理新检测到的车辆"""
+        if vehicle_type == 'construction':
+            # 工程车辆：检查蓝牙信标
+            return self.check_construction_vehicle(track_id, bbox, image, detected_class=class_name, detection_confidence=detection_confidence)
+        elif vehicle_type == 'civilian':
+            # 社会车辆：识别车牌（社会车辆不使用检测置信度，使用车牌识别置信度）
+            return self.check_civilian_vehicle(track_id, bbox, image)
+        return None
+    
+    def _create_construction_alert(
+        self, track_id, bbox, image, detected_class, beacon_info, match_cost=None, detection_confidence=0.0
+    ):
+        """
+        从匹配结果创建工程车辆alert
+        
+        Args:
+            track_id: 跟踪ID
+            bbox: 边界框
+            image: 图像
+            detected_class: 检测到的类别
+            beacon_info: 信标信息（可能为None，表示无匹配）
+            match_cost: 匹配代价
+            
+        Returns:
+            alert字典
+        """
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        # 计算距离
+        distance = None
+        if self.depth_camera:
+            distance, _ = self.depth_camera.get_depth_at_bbox_bottom_robust(
+                bbox, window_size=5, outlier_threshold=2.0
+            )
+            if distance is None:
+                depth_method = self.depth_config.get('method', 'median')
+                distance, _ = self.depth_camera.get_depth_region_stats(bbox, method=depth_method)
+        
+        # 如果没有信标信息，标记为未备案
+        if beacon_info is None:
+            alert = {
+                'track_id': track_id,
+                'type': 'construction_vehicle',  # 修正：工程车辆类型
+                'status': 'unregistered',
+                'message': "⚠ 未备案工程车辆！",
+                'detected_type': detected_class,
+                'detected_class': detected_class,  # 确保字段存在
+                'distance': distance,
+                'confidence': detection_confidence,  # 使用检测置信度
+                'match_cost': match_cost,
+                'color': COLORS['unregistered']
+            }
+            return alert
+        
+        # 验证车辆类型是否匹配
+        beacon_vehicle_type = beacon_info.get('vehicle_type', 'unknown')
+        type_matched = True
+        
+        if detected_class:
+            detected_normalized = detected_class.replace('-', '_').replace('_', '-')
+            beacon_normalized = beacon_vehicle_type.replace('_', '-')
+            
+            if detected_normalized != beacon_normalized:
+                type_matched = False
+        
+        if type_matched:
+            alert = {
+                'track_id': track_id,
+                'type': 'construction_vehicle',  # 修正：工程车辆类型
+                'status': 'registered',
+                'message': f"工程车辆 (已备案)",
+                'vehicle_type': beacon_info.get('vehicle_type', 'Unknown'),
+                'detected_class': detected_class,  # 添加 detected_class
+                'beacon_mac': beacon_info['mac'],
+                'plate_number': beacon_info.get('plate_number', ''),
+                'company': beacon_info.get('company', ''),
+                'environment_code': beacon_info.get('environment_code'),  # 添加环境编码
+                'rssi': beacon_info['rssi'],
+                'distance': distance,
+                'confidence': detection_confidence,  # 使用检测置信度，不是信标置信度
+                'match_cost': match_cost,
+                'color': COLORS['construction']
+            }
+        else:
+            alert = {
+                'track_id': track_id,
+                'type': 'construction_vehicle',  # 修正：工程车辆类型
+                'status': 'unregistered',
+                'message': "⚠ 未备案工程车辆！（类型不匹配）",
+                'detected_type': detected_class,
+                'detected_class': detected_class,  # 确保字段存在
+                'beacon_type': beacon_vehicle_type,
+                'distance': distance,
+                'confidence': detection_confidence,  # 使用检测置信度
+                'match_cost': match_cost,
+                'color': COLORS['unregistered']
+            }
+        
+        return alert
+    
+    def check_construction_vehicle(self, track_id, bbox, image, detected_class=None, detection_confidence=0.0):
+        """检查工程车辆（使用智能过滤器）"""
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        print(f"\n{'='*70}")
+        print(f"🔍 检查工程车辆 Track#{track_id}")
+        if detected_class:
+            print(f"  🚜 检测类型: {detected_class}")
+        
+        # 计算距离（使用区域平均更稳定）
+        distance = None
+        depth_confidence = 0.0
+        if self.depth_camera:
+            # 优先使用鲁棒方法（小窗口中位数+离群值过滤）
+            distance, depth_confidence = self.depth_camera.get_depth_at_bbox_bottom_robust(
+                bbox, window_size=5, outlier_threshold=2.0
+            )
+            
+            # 如果鲁棒方法失败，尝试使用bbox区域平均（使用配置的方法）
+            if distance is None:
+                depth_method = self.depth_config.get('method', 'median')
+                distance, depth_confidence = self.depth_camera.get_depth_region_stats(bbox, method=depth_method)
+            
+            # 如果还是失败，使用中心点作为最后备用
+            if distance is None:
+                distance = self.depth_camera.get_depth_at_point(int(cx), int(cy))
+                if distance:
+                    depth_confidence = 1.0  # 单点测量，假设置信度为1.0
+            
+            if distance:
+                print(f"  📏 相机深度: {distance:.2f} m (置信度: {depth_confidence:.1%})")
+                if depth_confidence < 0.3:
+                    print(f"  ⚠ 深度置信度较低，可能影响信标匹配准确性")
+            else:
+                print(f"  📏 相机深度: 无法获取（可能物体太近或深度数据无效）")
+        
+        # 使用智能过滤器查询蓝牙信标
+        beacon_info = None
+        if self.beacon_client and self.beacon_filter:
+            # 获取所有扫描到的信标
+            all_beacons = self.beacon_client.get_beacons()
+            print(f"  📡 Cassia扫描到: {len(all_beacons)} 个信标")
+            
+            if all_beacons:
+                # 使用过滤器进行多级过滤
+                beacon_info = self.beacon_filter.get_best_match(
+                    all_beacons, 
+                    camera_depth=distance,
+                    bbox=bbox
+                )
+                
+                if beacon_info:
+                    print(f"\n  ✅ 最佳匹配信标:")
+                    print(f"     MAC: {beacon_info['mac']}")
+                    print(f"     车辆类型: {beacon_info.get('vehicle_type', 'Unknown')}")
+                    if beacon_info.get('plate_number'):
+                        print(f"     车牌号: {beacon_info['plate_number']}")
+                    if beacon_info.get('company'):
+                        print(f"     所属: {beacon_info['company']}")
+                    print(f"     RSSI: {beacon_info['rssi']} dBm")
+                    print(f"     距离: {beacon_info.get('distance', 0):.1f} m")
+                    print(f"     置信度: {beacon_info['confidence']:.2f}")
+                    if 'duration' in beacon_info:
+                        print(f"     持续时间: {beacon_info['duration']:.1f} s")
+                else:
+                    print(f"  ✗ 无有效匹配（所有信标均被过滤或置信度不足）")
+            else:
+                print(f"  ✗ 未扫描到任何信标")
+        elif not self.beacon_client:
+            print(f"  ✗ Cassia客户端未启动")
+        elif not self.beacon_filter:
+            print(f"  ✗ 信标过滤器未初始化")
+        
+        # 判断
+        if beacon_info:
+            # 验证车辆类型是否匹配
+            beacon_vehicle_type = beacon_info.get('vehicle_type', 'unknown')
+            type_matched = True
+            
+            if detected_class:
+                # 标准化类型名称（处理连字符）
+                detected_normalized = detected_class.replace('-', '_').replace('_', '-')
+                beacon_normalized = beacon_vehicle_type.replace('_', '-')
+                
+                # 检查是否匹配
+                if detected_normalized != beacon_normalized:
+                    type_matched = False
+                    print(f"\n  ⚠️  车辆类型不匹配:")
+                    print(f"     检测类型: {detected_class}")
+                    print(f"     信标绑定: {beacon_vehicle_type}")
+            
+            if type_matched:
+                alert = {
+                    'track_id': track_id,
+                    'type': 'construction_vehicle',  # 修正：工程车辆类型
+                    'status': 'registered',
+                    'message': f"工程车辆 (已备案)",
+                    'vehicle_type': beacon_info.get('vehicle_type', 'Unknown'),
+                    'detected_class': detected_class,  # 添加 detected_class
+                    'beacon_mac': beacon_info['mac'],
+                    'plate_number': beacon_info.get('plate_number', ''),
+                    'company': beacon_info.get('company', ''),
+                    'environment_code': beacon_info.get('environment_code'),  # 添加环境编码
+                    'rssi': beacon_info['rssi'],
+                    'distance': distance,
+                    'confidence': detection_confidence,  # 使用检测置信度，不是信标置信度
+                    'color': COLORS['construction']
+                }
+                print(f"\n  ✅ 结果: 已备案工程车辆")
+                if beacon_info.get('plate_number'):
+                    print(f"     车牌: {beacon_info['plate_number']}")
+            else:
+                # 类型不匹配，视为未备案
+                alert = {
+                    'track_id': track_id,
+                    'type': 'construction_vehicle',  # 修正：工程车辆类型
+                    'status': 'unregistered',
+                    'message': "⚠ 未备案工程车辆！（类型不匹配）",
+                    'detected_type': detected_class,
+                    'detected_class': detected_class,  # 确保字段存在
+                    'beacon_type': beacon_vehicle_type,
+                    'distance': distance,
+                    'confidence': detection_confidence,  # 使用检测置信度
+                    'color': COLORS['unregistered']
+                }
+                print(f"\n  🚨 结果: 未备案工程车辆！（检测为{detected_class}，信标绑定为{beacon_vehicle_type}）")
+        else:
+            alert = {
+                'track_id': track_id,
+                'type': 'construction_vehicle',  # 修正：工程车辆类型
+                'status': 'unregistered',
+                'message': "⚠ 未备案工程车辆！",
+                'detected_class': detected_class,  # 添加 detected_class
+                'distance': distance,
+                'confidence': detection_confidence,  # 使用检测置信度
+                'color': COLORS['unregistered']
+            }
+            print(f"\n  🚨 结果: 未备案工程车辆！")
+        
+        print(f"{'='*70}\n")
+        return alert
+    
+    def check_civilian_vehicle(self, track_id, bbox, image, class_name=None):
+        """检查社会车辆（异步车牌识别）"""
+        x1, y1, x2, y2 = bbox
+        
+        print(f"\n{'='*70}")
+        print(f"🚗 检查社会车辆 Track#{track_id}")
+        if class_name:
+            print(f"  🚗 检测类型: {class_name}")
+        
+        # 识别车牌（异步处理）
+        plate_number = None
+        confidence = 0.0
+        
+        if self.async_lpr:
+            # 裁剪车辆区域
+            vehicle_roi = image[int(y1):int(y2), int(x1):int(x2)]
+            
+            if vehicle_roi.size > 0 and vehicle_roi.shape[0] > 20 and vehicle_roi.shape[1] > 20:
+                # 转换为BGR
+                vehicle_roi_bgr = cv2.cvtColor(vehicle_roi, cv2.COLOR_RGB2BGR)
+                
+                # 提交异步识别任务
+                submitted = self.async_lpr.submit_recognition(track_id, vehicle_roi_bgr, class_name or 'car')
+                
+                if submitted:
+                    print(f"  📤 已提交车牌识别任务（异步）")
+                else:
+                    # 检查是否有已完成的结果
+                    plate_number, confidence = self.async_lpr.get_result(track_id)
+                    if plate_number:
+                        print(f"  ✓ 车牌号: {plate_number} (置信度: {confidence:.2f})")
+                    else:
+                        print(f"  ⚠ 未提交识别任务（可能因频率限制或ROI质量不足）")
+        elif self.lpr_detector:
+            # 回退到同步处理（旧方法）
+            print(f"  ⚠ 使用同步LPR处理（异步处理器未初始化）")
+            # 裁剪车辆区域
+            vehicle_roi = image[int(y1):int(y2), int(x1):int(x2)]
+            print(f"  📐 车辆ROI尺寸: {vehicle_roi.shape}")
+            
+            if vehicle_roi.size > 0 and vehicle_roi.shape[0] > 20 and vehicle_roi.shape[1] > 20:
+                try:
+                    # 转换为BGR（HyperLPR需要BGR）
+                    vehicle_roi_bgr = cv2.cvtColor(vehicle_roi, cv2.COLOR_RGB2BGR)
+                    
+                    # 图像预处理：大幅提升车牌识别性能
+                    # 1. 提高最小尺寸以改善识别率
+                    min_height = 120  # 从50提升到120
+                    min_width = 320   # 从150提升到320
+                    if vehicle_roi_bgr.shape[0] < min_height or vehicle_roi_bgr.shape[1] < min_width:
+                        scale = max(min_height / vehicle_roi_bgr.shape[0], min_width / vehicle_roi_bgr.shape[1])
+                        new_width = int(vehicle_roi_bgr.shape[1] * scale)
+                        new_height = int(vehicle_roi_bgr.shape[0] * scale)
+                        vehicle_roi_bgr = cv2.resize(vehicle_roi_bgr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)  # 使用更好的插值方法
+                    
+                    # 2. 适当提高最大尺寸限制以保持细节
+                    max_height = 400  # 从300提升到400
+                    max_width = 1000  # 从800提升到1000
+                    if vehicle_roi_bgr.shape[0] > max_height or vehicle_roi_bgr.shape[1] > max_width:
+                        scale = min(max_height / vehicle_roi_bgr.shape[0], max_width / vehicle_roi_bgr.shape[1])
+                        new_width = int(vehicle_roi_bgr.shape[1] * scale)
+                        new_height = int(vehicle_roi_bgr.shape[0] * scale)
+                        vehicle_roi_bgr = cv2.resize(vehicle_roi_bgr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)  # 使用更好的插值方法
+                    
+                    # 3. 增强图像预处理以提高车牌识别率
+                    # 3a. 去噪
+                    denoised = cv2.bilateralFilter(vehicle_roi_bgr, 9, 75, 75)
+                    
+                    # 3b. 锐化
+                    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                    sharpened = cv2.filter2D(denoised, -1, kernel)
+                    
+                    # 3c. 增强对比度（更强的CLAHE）
+                    lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
+                    l, a, b = cv2.split(lab)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))  # 增强clipLimit
+                    l = clahe.apply(l)
+                    vehicle_roi_bgr = cv2.merge([l, a, b])
+                    vehicle_roi_bgr = cv2.cvtColor(vehicle_roi_bgr, cv2.COLOR_LAB2BGR)
+                    
+                    print(f"  📐 预处理后ROI尺寸: {vehicle_roi_bgr.shape} (去噪+锐化+增强对比度)")
+                    
+                    # LicensePlateCatcher是可调用对象，直接调用
+                    # results = catcher(image)
+                    # 返回: [Plate对象] 或 []
+                    results = self.lpr_detector(vehicle_roi_bgr)
+                    print(f"  🔍 识别结果数量: {len(results) if results else 0}")
+                    
+                    if results and len(results) > 0:
+                        plate = results[0]
+                        # 处理不同的返回格式
+                        # 注意：HyperLPR3可能返回Plate对象、字符串、字典或列表
+                        try:
+                            if isinstance(plate, str):
+                                # 如果直接返回字符串
+                                plate_number = plate
+                                confidence = 1.0
+                            elif hasattr(plate, 'code'):
+                                # 如果是Plate对象（标准情况）
+                                plate_number = plate.code
+                                confidence = getattr(plate, 'confidence', 0.0)
+                            elif isinstance(plate, dict):
+                                # 如果是字典
+                                plate_number = plate.get('code', plate.get('plate', ''))
+                                confidence = plate.get('confidence', 0.0)
+                            elif isinstance(plate, (list, tuple)):
+                                # 如果results[0]本身是列表/元组（异常情况）
+                                if len(plate) > 0:
+                                    # 尝试从列表中提取车牌信息
+                                    first_item = plate[0]
+                                    if isinstance(first_item, str):
+                                        plate_number = first_item
+                                    elif hasattr(first_item, 'code'):
+                                        plate_number = first_item.code
+                                    else:
+                                        plate_number = str(first_item)
+                                    confidence = 1.0
+                                else:
+                                    plate_number = None
+                                    confidence = 0.0
+                            else:
+                                # 其他情况，尝试转换为字符串
+                                plate_number = str(plate)
+                                confidence = 0.5
+                            
+                            if plate_number:
+                                print(f"  ✓ 车牌号: {plate_number} (置信度: {confidence:.2f})")
+                            else:
+                                print(f"  ✗ 车牌号为空")
+                        except Exception as e:
+                            print(f"  ✗ 解析车牌结果异常: {e}")
+                            print(f"  ℹ 结果类型: {type(plate)}, 值: {plate}")
+                            plate_number = None
+                            confidence = 0.0
+                    else:
+                        print(f"  ✗ 未识别到车牌")
+                except Exception as e:
+                    print(f"  ✗ 车牌识别异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"  ✗ ROI太小，跳过识别")
+        else:
+            print(f"  ✗ 车牌识别器未初始化（同步模式）")
+        
+        # 同步模式返回结果
+        alert = {
+            'track_id': track_id,
+            'type': 'social_vehicle',  # 修正：社会车辆类型
+            'status': 'identified' if plate_number else 'failed',
+            'message': f"社会车辆",
+            'plate': plate_number,
+            'plate_number': plate_number,  # 确保两个字段都有
+            'detected_class': class_name or 'car',  # 社会车辆只有 car 类别
+            'color': COLORS['civilian']
+        }
+        
+        if plate_number:
+            print(f"  ✅ 结果: 社会车辆 {plate_number}")
+        else:
+            print(f"  ℹ  结果: 社会车辆（未识别车牌）")
+        
+        print(f"{'='*70}\n")
+        return alert
+    
+    def draw_results(self, image, tracks, alerts_dict):
+        """绘制结果"""
+        # 转换为PIL用于中文
+        pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        
+        for track_id, track in tracks.items():
+            bbox = track['bbox']
+            class_id = track['class']
+            class_name = CUSTOM_CLASSES.get(class_id, f"unknown_{class_id}")
+            
+            # 获取车辆类型
+            vehicle_type = VEHICLE_CLASSES.get(class_name)
+            if not vehicle_type:
+                continue
+            
+            # 缩放bbox到原图
+            h, w = image.shape[:2]
+            input_h, input_w = self.inference.input_shape[2], self.inference.input_shape[3]
+            x1 = int(bbox[0] * w / input_w)
+            y1 = int(bbox[1] * h / input_h)
+            x2 = int(bbox[2] * w / input_w)
+            y2 = int(bbox[3] * h / input_h)
+            
+            # 获取颜色
+            alert = alerts_dict.get(track_id)
+            if alert:
+                color = alert['color']
+                label = alert['message']
+                if alert['type'] == 'civilian' and alert.get('plate'):
+                    label += f" {alert['plate']}"
+            else:
+                color = COLORS[vehicle_type]
+                label = f"{class_name} #{track_id}"
+            
+            # 用OpenCV画框
+            image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            
+            # 用PIL画中文标签
+            pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            display_cfg = self.config.get_display()
+            label_y = y1 - display_cfg['label_offset_y']
+            draw.text((x1, label_y), label, font=self.font_small, fill=color)
+        
+        # 转回OpenCV格式
+        image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        
+        # 绘制FPS和统计
+        cv2.putText(image, f"FPS: {self.fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(image, f"Tracks: {len(tracks)}", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        return image
+    
+    def run(self):
+        """主循环"""
+        print("\n开始实时检测...")
+        
+        # 启动云端白名单更新线程（如果使用云端白名单）
+        whitelist_update_thread = None
+        if self.cloud_whitelist_manager:
+            import threading
+            def update_whitelist_periodically():
+                """定期更新白名单"""
+                while True:
+                    try:
+                        time.sleep(self.cloud_whitelist_manager.update_interval)
+                        if self.cloud_whitelist_manager.fetch_whitelist():
+                            # 更新BeaconFilter中的白名单
+                            if self.beacon_filter:
+                                self.beacon_filter.refresh_whitelist()
+                    except Exception as e:
+                        print(f"⚠ 白名单更新线程错误: {e}")
+            
+            whitelist_update_thread = threading.Thread(
+                target=update_whitelist_periodically, 
+                daemon=True
+            )
+            whitelist_update_thread.start()
+            print(f"✅ 云端白名单更新线程已启动（每{self.cloud_whitelist_manager.update_interval}秒更新一次）")
+        print("按 'q' 退出\n")
+        
+        fps_start_time = time.time()
+        fps_frame_count = 0
+        
+        alerts_dict = {}  # {track_id: alert_info}
+        self.tracks = {}  # 初始化tracks字典，供stats回调使用
+        
+        # 更新统计信息回调函数（包含tracks信息）
+        if self.cloud_integration and hasattr(self, '_stats_callback_initialized'):
+            def get_stats_with_tracks():
+                return {
+                    'frame_count': self.frame_count,
+                    'fps': self.fps,
+                    'total_alerts': len(self.alerts),
+                    'active_tracks': len(self.tracks),
+                    'queue_size': self.cloud_integration.get_queue_size() if self.cloud_integration else 0
+                }
+            self.cloud_integration.set_stats_callback(get_stats_with_tracks)
+        
+        # 启动硬件监控线程
+        if self.hardware_recovery:
+            recovery_cfg = self.config.get_recovery()
+            hardware_monitor_thread = self.hardware_recovery.start_monitoring(
+                self.depth_camera,
+                self.beacon_client,
+                check_interval=10.0,
+                daemon=True
+            )
+            print("[硬件恢复] 硬件监控线程已启动")
+        
+        # 启动网络监控线程
+        if self.network_recovery and self.beacon_client:
+            network_monitor_thread = self.network_recovery.start_monitoring(
+                self.beacon_client,
+                daemon=True
+            )
+            print("[网络恢复] 网络监控线程已启动")
+        
+        try:
+            consecutive_failures = 0
+            max_consecutive_failures = 10
+            
+            while True:
+                # 从Orbbec相机获取帧
+                if self.depth_camera:
+                    frame = self.depth_camera.get_color_frame()
+                    if frame is None:
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            print(f"[硬件恢复] ⚠ 连续 {consecutive_failures} 次获取帧失败，尝试恢复相机...")
+                            if self.hardware_recovery:
+                                self.hardware_recovery.recover_camera()
+                            consecutive_failures = 0
+                        time.sleep(0.1)  # 失败时等待更长时间
+                        continue
+                    else:
+                        consecutive_failures = 0  # 重置失败计数
+                    
+                    # 保存帧到共享缓冲区（供录制脚本使用）
+                    if self.enable_frame_sharing:
+                        try:
+                            np.save(self.shared_frame_file, frame)
+                            # 同时保存深度帧（如果可用）
+                            with self.depth_camera.depth_lock:
+                                if self.depth_camera.depth_frame is not None:
+                                    depth_frame = self.depth_camera.depth_frame
+                                    width = depth_frame.get_width()
+                                    height = depth_frame.get_height()
+                                    depth_data = np.frombuffer(
+                                        depth_frame.get_data(),
+                                        dtype=np.uint16
+                                    )
+                                    depth_image = depth_data.reshape((height, width))
+                                    np.save(self.shared_depth_file, depth_image)
+                        except Exception as e:
+                            pass  # 忽略保存错误，不影响主程序运行
+                else:
+                    print("错误：未启用深度相机")
+                    break
+                
+                # 预处理
+                input_data = self.inference.preprocess(frame)
+                
+                # 推理
+                output = self.inference.infer(input_data)
+                
+                # 后处理
+                boxes, confidences, class_ids = self.inference.postprocess(output)
+                
+                # 多帧验证（减少假阳性）
+                if self.multi_frame_validator:
+                    original_count = len(boxes)
+                    boxes, class_ids, confidences = self.multi_frame_validator.validate_detections(
+                        boxes, class_ids, confidences
+                    )
+                    filtered_count = len(boxes)
+                    if original_count > filtered_count:
+                        print(f"  [多帧验证] 过滤 {original_count - filtered_count} 个假阳性检测（剩余 {filtered_count} 个）")
+                
+                # 所有检测都是车辆（自定义模型只检测车辆）
+                vehicle_indices = list(range(len(class_ids)))
+                # 或者过滤：
+                # vehicle_indices = []
+                # for i, class_id in enumerate(class_ids):
+                #     class_name = CUSTOM_CLASSES.get(class_id, '')
+                #     if class_name in VEHICLE_CLASSES:
+                #         vehicle_indices.append(i)
+                
+                if len(vehicle_indices) > 0:
+                    vehicle_boxes = boxes[vehicle_indices]
+                    vehicle_class_ids = class_ids[vehicle_indices]
+                    vehicle_confidences = confidences[vehicle_indices]
+                else:
+                    vehicle_boxes = np.array([])
+                    vehicle_class_ids = np.array([])
+                    vehicle_confidences = np.array([])
+                
+                # 跟踪（根据跟踪器类型调用不同方法）
+                if self.tracker_type == 'bytetrack':
+                    # ByteTrack需要scores参数
+                    tracks = self.tracker.update(
+                        vehicle_boxes, 
+                        vehicle_confidences, 
+                        vehicle_class_ids, 
+                        self.frame_count
+                    )
+                else:
+                    # Simple IoU跟踪器（需要传递置信度）
+                    tracks = self.tracker.update(vehicle_boxes, vehicle_class_ids, self.frame_count, confidences=vehicle_confidences)
+                
+                # 更新self.tracks供stats回调使用
+                self.tracks = tracks
+                
+                # 处理新车辆（支持多目标匹配）
+                new_construction_vehicles = []  # 收集新的工程车辆
+                new_civilian_vehicles = []  # 收集新的社会车辆
+                
+                for track_id, track in tracks.items():
+                    if not track['processed'] and track_id not in alerts_dict:
+                        class_name = CUSTOM_CLASSES.get(track['class'], 'unknown')
+                        vehicle_type = VEHICLE_CLASSES.get(class_name, 'construction')  # 默认工程车辆
+                        
+                        # 缩放bbox到原图
+                        h, w = frame.shape[:2]
+                        input_h, input_w = self.inference.input_shape[2], self.inference.input_shape[3]
+                        bbox = track['bbox']
+                        bbox_scaled = [
+                            bbox[0] * w / input_w,
+                            bbox[1] * h / input_h,
+                            bbox[2] * w / input_w,
+                            bbox[3] * h / input_h
+                        ]
+                        
+                        if vehicle_type == 'construction':
+                            # 收集工程车辆信息，稍后批量处理
+                            # 获取检测置信度（从track中获取，ByteTracker使用'score'，VehicleTracker使用'confidence'）
+                            detection_confidence = track.get('confidence', track.get('score', 0.0))
+                            new_construction_vehicles.append({
+                                'track_id': track_id,
+                                'bbox': bbox_scaled,
+                                'class_name': class_name,
+                                'image': frame,
+                                'confidence': detection_confidence  # 添加检测置信度
+                            })
+                        else:
+                            # 社会车辆：提交异步识别任务
+                            if self.async_lpr:
+                                vehicle_roi = frame[int(bbox_scaled[1]):int(bbox_scaled[3]), 
+                                                   int(bbox_scaled[0]):int(bbox_scaled[2])]
+                                if vehicle_roi.size > 0:
+                                    vehicle_roi_bgr = cv2.cvtColor(vehicle_roi, cv2.COLOR_RGB2BGR)
+                                    self.async_lpr.submit_recognition(track_id, vehicle_roi_bgr, class_name)
+                                
+                                # 创建初始alert（车牌号稍后更新）
+                                # 获取检测置信度（从track中获取，ByteTracker使用'score'，VehicleTracker使用'confidence'）
+                                detection_confidence = track.get('confidence', track.get('score', 0.0))
+                                alert = {
+                                    'track_id': track_id,
+                                    'type': 'social_vehicle',  # 修正：社会车辆类型
+                                    'status': 'identifying',
+                                    'message': f"社会车辆",
+                                    'plate': None,
+                                    'plate_number': None,
+                                    'detected_class': class_name,  # 社会车辆只有 car 类别
+                                    'confidence': detection_confidence,  # 添加检测置信度
+                                    'color': COLORS['civilian']
+                                }
+                                alerts_dict[track_id] = alert
+                                self.alerts.append(alert)
+                                # 保存到数据库
+                                if self.detection_db:
+                                    try:
+                                        detection_data = {
+                                            'timestamp': datetime.now().isoformat(),
+                                            'track_id': alert.get('track_id'),
+                                            'type': alert.get('type'),
+                                            'detected_class': class_name,
+                                            'status': alert.get('status'),
+                                            'plate_number': alert.get('plate'),
+                                            'distance': None,
+                                            'confidence': alert.get('confidence', 0.0),  # 使用alert中的检测置信度
+                                            'bbox': bbox_scaled,
+                                            'snapshot_path': None,
+                                            'metadata': {}
+                                        }
+                                        record_id = self.detection_db.insert_detection(detection_data)
+                                        alert['db_id'] = record_id
+                                    except Exception as e:
+                                        print(f"⚠ 保存检测结果到数据库失败: {e}")
+                                # 保存快照并上传到云端
+                                self._save_snapshot_and_upload(alert, frame, bbox_scaled)
+                            else:
+                                # 无异步处理器，使用同步处理
+                                # 获取检测置信度（从track中获取，ByteTracker使用'score'，VehicleTracker使用'confidence'）
+                                detection_confidence = track.get('confidence', track.get('score', 0.0))
+                                alert = self.process_new_vehicle(track_id, vehicle_type, bbox_scaled, frame, class_name=class_name, detection_confidence=detection_confidence)
+                                if alert:
+                                    alerts_dict[track_id] = alert
+                                    self.alerts.append(alert)
+                                    # 保存快照并上传到云端
+                                    self._save_snapshot_and_upload(alert, frame, bbox_scaled)
+                            
+                            # 标记为已处理
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(track_id)
+                
+                # 检查异步LPR结果并更新alerts
+                if self.async_lpr:
+                    for track_id in list(alerts_dict.keys()):
+                        alert = alerts_dict.get(track_id)
+                        if alert and alert.get('type') == 'civilian' and alert.get('status') == 'identifying':
+                            plate_number, confidence = self.async_lpr.get_result(track_id)
+                            if plate_number:
+                                # 更新alert
+                                alert['status'] = 'identified'
+                                alert['plate'] = plate_number
+                                alert['message'] = f"社会车辆 {plate_number}"
+                                print(f"  ✅ Track#{track_id} 车牌识别完成: {plate_number}")
+                            elif plate_number is None and confidence is None:
+                                # 任务还在执行中，继续等待
+                                pass
+                            else:
+                                # 识别失败
+                                alert['status'] = 'failed'
+                                alert['message'] = f"社会车辆（未识别车牌）"
+                
+                # 批量处理工程车辆（使用多目标匹配）
+                if new_construction_vehicles and self.beacon_client and self.beacon_filter:
+                    all_beacons = self.beacon_client.get_beacons()
+                    if all_beacons and len(new_construction_vehicles) > 0:
+                        # 准备车辆信息（包含深度）
+                        vehicles_info = []
+                        for vehicle in new_construction_vehicles:
+                            # 计算深度
+                            distance = None
+                            if self.depth_camera:
+                                distance, _ = self.depth_camera.get_depth_at_bbox_bottom_robust(
+                                    vehicle['bbox'], window_size=5, outlier_threshold=2.0
+                                )
+                                if distance is None:
+                                    depth_method = self.depth_config.get('method', 'median')
+                                    distance, _ = self.depth_camera.get_depth_region_stats(
+                                        vehicle['bbox'], method=depth_method
+                                    )
+                            
+                            vehicles_info.append({
+                                'track_id': vehicle['track_id'],
+                                'bbox': vehicle['bbox'],
+                                'camera_depth': distance,
+                                'detected_class': vehicle['class_name']
+                            })
+                        
+                        # 使用多目标匹配
+                        if len(new_construction_vehicles) > 1:
+                            # 多个车辆，使用多目标匹配
+                            print(f"\n  🔍 [匹配] 开始多目标匹配: {len(new_construction_vehicles)} 辆车, {len(all_beacons)} 个信标")
+                            match_results = self.beacon_filter.match_multiple_targets(
+                                vehicles_info, all_beacons
+                            )
+                            
+                            # 处理匹配结果
+                            for i, vehicle in enumerate(new_construction_vehicles):
+                                match_result = match_results[i] if i < len(match_results) else None
+                                if match_result and match_result['matched']:
+                                    # 有匹配，使用匹配结果
+                                    alert = self._create_construction_alert(
+                                        vehicle['track_id'],
+                                        vehicle['bbox'],
+                                        vehicle['image'],
+                                        vehicle['class_name'],
+                                        match_result['beacon_info'],
+                                        match_result['cost'],
+                                        detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
+                                    )
+                                else:
+                                    # 无匹配，标记为未备案（不再使用单目标匹配回退，因为信标数量限制已处理）
+                                    print(f"  ⚠️  [匹配] Track {vehicle['track_id']} 无匹配，标记为未备案")
+                                    alert = self._create_construction_alert(
+                                        vehicle['track_id'],
+                                        vehicle['bbox'],
+                                        vehicle['image'],
+                                        vehicle['class_name'],
+                                        None,  # 无信标信息
+                                        None,  # match_cost
+                                        detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
+                                    )
+                                
+                                if alert:
+                                    alerts_dict[vehicle['track_id']] = alert
+                                    self.alerts.append(alert)
+                                    # 保存到数据库
+                                    if self.detection_db:
+                                        try:
+                                            detection_data = {
+                                                'timestamp': datetime.now().isoformat(),
+                                                'track_id': alert.get('track_id'),
+                                                'type': alert.get('type'),
+                                                'detected_class': vehicle['class_name'],
+                                                'status': alert.get('status'),
+                                                'beacon_mac': alert.get('beacon_mac'),
+                                                'plate_number': alert.get('plate_number'),
+                                                'company': alert.get('company'),
+                                                'distance': alert.get('distance'),
+                                                'confidence': alert.get('confidence', 0.0),
+                                                'bbox': vehicle['bbox'],
+                                                'snapshot_path': None,  # 将在_save_snapshot_and_upload中更新
+                                                'metadata': {
+                                                    'rssi': alert.get('rssi'),
+                                                    'match_cost': alert.get('match_cost')
+                                                }
+                                            }
+                                            record_id = self.detection_db.insert_detection(detection_data)
+                                            # 更新alert中的数据库ID（如果需要）
+                                            alert['db_id'] = record_id
+                                        except Exception as e:
+                                            print(f"⚠ 保存检测结果到数据库失败: {e}")
+                                    # 保存快照并上传到云端
+                                    self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                        else:
+                            # 单个车辆，使用单目标匹配
+                            vehicle = new_construction_vehicles[0]
+                            alert = self.check_construction_vehicle(
+                                vehicle['track_id'],
+                                vehicle['bbox'],
+                                vehicle['image'],
+                                detected_class=vehicle['class_name'],
+                                detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
+                            )
+                            if alert:
+                                alerts_dict[vehicle['track_id']] = alert
+                                self.alerts.append(alert)
+                                # 保存到数据库
+                                if self.detection_db:
+                                    try:
+                                        detection_data = {
+                                            'timestamp': datetime.now().isoformat(),
+                                            'track_id': alert.get('track_id'),
+                                            'type': alert.get('type'),
+                                            'detected_class': vehicle['class_name'],
+                                            'status': alert.get('status'),
+                                            'beacon_mac': alert.get('beacon_mac'),
+                                            'plate_number': alert.get('plate_number'),
+                                            'company': alert.get('company'),
+                                            'distance': alert.get('distance'),
+                                            'confidence': alert.get('confidence', 0.0),
+                                            'bbox': vehicle['bbox'],
+                                            'snapshot_path': None,
+                                            'metadata': {
+                                                'rssi': alert.get('rssi'),
+                                                'match_cost': alert.get('match_cost')
+                                            }
+                                        }
+                                        record_id = self.detection_db.insert_detection(detection_data)
+                                        alert['db_id'] = record_id
+                                    except Exception as e:
+                                        print(f"⚠ 保存检测结果到数据库失败: {e}")
+                                # 保存快照并上传到云端
+                                self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                        
+                        # 标记所有工程车辆为已处理
+                        for vehicle in new_construction_vehicles:
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(vehicle['track_id'])
+                elif new_construction_vehicles:
+                    # 无信标客户端，逐个处理
+                    for vehicle in new_construction_vehicles:
+                        alert = self.check_construction_vehicle(
+                            vehicle['track_id'],
+                            vehicle['bbox'],
+                            vehicle['image'],
+                            detected_class=vehicle['class_name']
+                        )
+                        if alert:
+                            alerts_dict[vehicle['track_id']] = alert
+                            self.alerts.append(alert)
+                            # 保存到数据库
+                            if self.detection_db:
+                                try:
+                                    detection_data = {
+                                        'timestamp': datetime.now().isoformat(),
+                                        'track_id': alert.get('track_id'),
+                                        'type': alert.get('type'),
+                                        'detected_class': vehicle['class_name'],
+                                        'status': alert.get('status'),
+                                        'beacon_mac': alert.get('beacon_mac'),
+                                        'plate_number': alert.get('plate_number'),
+                                        'company': alert.get('company'),
+                                        'distance': alert.get('distance'),
+                                        'confidence': alert.get('confidence', 0.0),
+                                        'bbox': vehicle['bbox'],
+                                        'snapshot_path': None,
+                                        'metadata': {
+                                            'rssi': alert.get('rssi'),
+                                            'match_cost': alert.get('match_cost')
+                                        }
+                                    }
+                                    record_id = self.detection_db.insert_detection(detection_data)
+                                    alert['db_id'] = record_id
+                                except Exception as e:
+                                    print(f"⚠ 保存检测结果到数据库失败: {e}")
+                            # 保存快照并上传到云端
+                            self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                        if hasattr(self.tracker, 'mark_processed'):
+                            self.tracker.mark_processed(vehicle['track_id'])
+                        else:
+                            track['processed'] = True
+                
+                # 绘制结果
+                result_frame = self.draw_results(frame, tracks, alerts_dict)
+                
+                # 显示（如果启用）
+                if not self.no_display:
+                    display_cfg = self.config.get_display()
+                    try:
+                        cv2.imshow(display_cfg['window_name'], result_frame)
+                    except cv2.error as e:
+                        print(f"⚠ 显示错误: {e}")
+                        print("   切换到无头模式...")
+                        self.no_display = True
+                
+                # 计算FPS（使用配置的更新间隔）
+                performance_cfg = self.config.get_performance()
+                fps_update_interval = performance_cfg.get('fps_update_interval', 10)
+                fps_frame_count += 1
+                if fps_frame_count >= fps_update_interval:
+                    elapsed = time.time() - fps_start_time
+                    self.fps = fps_frame_count / elapsed
+                    fps_start_time = time.time()
+                    fps_frame_count = 0
+                    if self.no_display:
+                        print(f"[运行中] FPS: {self.fps:.1f} | 帧数: {self.frame_count} | 跟踪数: {len(tracks)}")
+                
+                self.frame_count += 1
+                
+                # 按键处理（使用配置的等待时间，无头模式时仅等待）
+                if not self.no_display:
+                    display_cfg = self.config.get_display()
+                    key = cv2.waitKey(display_cfg['wait_key_ms']) & 0xFF
+                    if key == ord('q'):
+                        break
+                else:
+                    # 无头模式：短暂等待，检查中断
+                    time.sleep(0.01)
+        
+        except KeyboardInterrupt:
+            print("\n中断检测...")
+        
+        finally:
+            if not self.no_display:
+                try:
+                    cv2.destroyAllWindows()
+                except:
+                    pass
+            if self.async_lpr:
+                self.async_lpr.shutdown()
+            if self.depth_camera:
+                self.depth_camera.stop()
+            if self.beacon_client:
+                self.beacon_client.stop()  # 正确的方法名
+            
+            # 打印统计
+            print("\n" + "="*70)
+            print("检测完成统计")
+            print("="*70)
+            print(f"总帧数: {self.frame_count}")
+            print(f"总报警: {len(self.alerts)}")
+            
+            construction_registered = sum(1 for a in self.alerts if a['type'] == 'construction' and a['status'] == 'registered')
+            construction_unregistered = sum(1 for a in self.alerts if a['type'] == 'construction' and a['status'] == 'unregistered')
+            civilian = sum(1 for a in self.alerts if a['type'] == 'civilian')
+            
+            print(f"\n车辆统计:")
+            print(f"  已备案工程车辆: {construction_registered}")
+            print(f"  未备案工程车辆: {construction_unregistered}")
+            print(f"  社会车辆: {civilian}")
+            print("="*70)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='实时车辆检测系统')
+    parser.add_argument('--config', type=str, default=None,
+                        help='配置文件路径（默认使用config.yaml）')
+    parser.add_argument('--engine', type=str, default=None,
+                        help='TensorRT引擎路径（覆盖配置文件中的设置）')
+    parser.add_argument('--cassia-ip', type=str, default=None,
+                        help='Cassia路由器IP地址（覆盖配置文件中的设置）')
+    parser.add_argument('--camera-id', type=str, default=None,
+                        help='摄像头ID（覆盖配置文件中的设置）')
+    parser.add_argument('--no-depth', action='store_true',
+                        help='禁用深度相机')
+    parser.add_argument('--no-display', action='store_true',
+                        help='禁用显示（无头模式，适合SSH远程运行）')
+    
+    args = parser.parse_args()
+    
+    # 创建检测系统（参数优先于配置文件）
+    system = RealtimeVehicleDetection(
+        config_path=args.config,
+        engine_path=args.engine,
+        cassia_router_ip=args.cassia_ip,
+        use_depth=not args.no_depth,
+        camera_id=args.camera_id,
+        no_display=args.no_display
+    )
+    
+    # 检查引擎文件
+    if not os.path.exists(system.engine_path):
+        print(f"错误：引擎文件不存在: {system.engine_path}")
+        return
+    
+    # 运行
+    system.run()
+
+
+if __name__ == '__main__':
+    main()
+

@@ -1,0 +1,137 @@
+# 工程机械实时识别系统配置文件
+
+# ============================================
+# 网络配置
+# ============================================
+network:
+  cassia_ip: "192.168.3.26"      # Cassia蓝牙路由器IP地址（工地部署：通过POE交换机连接到4G路由器）
+  camera_id: "camera_01"          # 摄像头ID（用于白名单过滤）
+
+# ============================================
+# 检测参数
+# ============================================
+detection:
+  conf_threshold: 0.7             # 检测置信度阈值 (0.0-1.0)，提高以减少误检和闪烁
+  iou_threshold: 0.5              # NMS的IoU阈值 (0.0-1.0)，适中以保持检测稳定性
+  model_path: "models/custom_yolo.engine"  # TensorRT模型文件路径
+  # 连续帧验证（减少假阳性）
+  multi_frame_validation:
+    enabled: true                  # 是否启用连续帧验证
+    min_frames: 3                 # 最小连续帧数（检测必须在此帧数内持续出现）
+    min_occurrence_ratio: 0.7     # 最小出现频率（在验证窗口内的出现比例）
+    validation_window: 5           # 验证窗口大小（帧数）
+    iou_threshold: 0.5            # 帧间匹配的IoU阈值
+
+# ============================================
+# 跟踪参数
+# ============================================
+tracking:
+  tracker_type: "bytetrack"       # 跟踪器类型: "simple_iou" 或 "bytetrack"
+  # Simple IoU跟踪器参数
+  iou_threshold: 0.3              # 跟踪匹配的IoU阈值 (0.0-1.0)
+  max_age: 30                     # 跟踪消失的最大帧数
+  # ByteTrack跟踪器参数
+  track_thresh: 0.6               # 跟踪阈值（提高以减少低质量跟踪）
+  high_thresh: 0.7                # 高置信度阈值（与检测阈值一致）
+  match_thresh: 0.7               # IoU匹配阈值（降低以提高跟踪稳定性）
+  track_buffer: 50                # 跟踪缓冲区大小（增加以减少ID切换）
+
+# ============================================
+# 文件路径配置
+# ============================================
+paths:
+  beacon_whitelist: "beacon_whitelist.yaml"  # 信标白名单配置文件路径
+  log_file: "/tmp/vehicle_detection.log"     # 日志文件路径
+  alert_log_file: "/tmp/vehicle_alerts.json" # 报警记录文件路径（JSON格式）
+  shared_frame_file: "/tmp/orbbec_shared_frame.npy"  # 共享RGB帧文件路径
+  shared_depth_file: "/tmp/orbbec_shared_depth.npy" # 共享深度帧文件路径
+  snapshot_dir: "/tmp/vehicle_snapshots"     # 车辆快照保存目录
+  detection_db_path: "detection_results.db"  # 检测结果数据库路径（SQLite）
+
+# ============================================
+# 云端上传配置
+# ============================================
+cloud:
+  enabled: true                               # 是否启用云端上传
+  api_base_url: "http://123.249.9.250:8000"  # 云端服务器地址
+  api_key: "kS3EhgTObprA48ruPkMg08DRX95x8ftv" # API密钥
+  upload_interval: 10                         # 上传间隔（秒）
+  max_image_size_mb: 10                       # 最大图片大小（MB），提高以支持更高分辨率
+  enable_image_upload: true                   # 是否上传图片
+  enable_alert_upload: true                   # 是否上传警报
+  retry_attempts: 3                          # 重试次数
+  retry_delay: 2.0                            # 重试延迟（秒）
+  save_snapshots: true                        # 是否保存本地快照
+  beacon_whitelist_update_interval: 300       # 信标白名单更新间隔（秒），默认5分钟
+  enable_cloud_whitelist: true                # 是否启用云端信标白名单（优先于本地配置）
+
+# ============================================
+# 深度测量参数
+# ============================================
+depth:
+  min_range: 0.1                  # 最小深度范围（米）
+  max_range: 10.0                 # 最大深度范围（米）
+  method: "median"               # 深度测量方法: median/mean/min
+  invalid_min: 0                  # 无效深度最小值（毫米，通常为0）
+  invalid_max: 65535              # 无效深度最大值（毫米，通常为65535）
+
+# ============================================
+# 日志配置
+# ============================================
+logging:
+  level: "INFO"                   # 日志级别: DEBUG/INFO/WARNING/ERROR
+  file_enabled: true              # 是否启用文件日志
+  console_enabled: true            # 是否启用控制台日志
+  max_file_size_mb: 10            # 单个日志文件最大大小（MB）
+  backup_count: 5                 # 保留的日志文件备份数量
+
+# ============================================
+# 性能配置
+# ============================================
+performance:
+  # 性能模式: "quality" (质量优先, 1080p, 25-30 FPS)
+  #          "balanced" (平衡模式, 720p, 40-50 FPS)
+  #          "speed" (速度优先, 720p, 50+ FPS)
+  mode: "quality"                 # 性能模式选择
+  input_resolution: [1920, 1080]  # 输入分辨率 [width, height]
+  frame_skip: 0                   # 跳帧数 (0=不跳帧, 1=跳1帧)
+  
+  # 性能监控
+  monitor_enabled: true            # 是否启用性能监控
+  fps_update_interval: 10         # FPS更新间隔（帧数）
+  gpu_monitor_enabled: true       # 是否监控GPU使用率
+  memory_monitor_enabled: true     # 是否监控内存使用
+
+# ============================================
+# 错误恢复配置
+# ============================================
+recovery:
+  camera_retry_enabled: true      # 是否启用相机自动重连
+  camera_retry_interval: 5.0     # 相机重连间隔（秒）
+  camera_max_retries: 10         # 相机最大重试次数（0表示无限重试）
+  
+  cassia_retry_enabled: true      # 是否启用Cassia自动重连
+  cassia_retry_interval: 3.0     # Cassia重连间隔（秒）
+  cassia_max_retries: 10         # Cassia最大重试次数（0表示无限重试）
+  
+  graceful_degradation: true      # 是否启用优雅降级（部分功能失效时继续运行）
+
+# ============================================
+# 显示配置
+# ============================================
+display:
+  window_name: "Vehicle Detection"  # 显示窗口名称
+  font_size_large: 24              # 大字体大小
+  font_size_small: 18              # 小字体大小
+  label_offset_y: 30               # 标签在bbox上方的偏移（像素）
+  wait_key_ms: 1                   # 显示刷新间隔（毫秒）
+  enable_detailed_drawing: true    # 是否启用详细绘制（性能模式下可禁用）
+
+# ============================================
+# 性能模式预设（自动应用，无需手动修改）
+# ============================================
+# quality模式: 1080p, 全功能, 目标25-30 FPS
+# balanced模式: 720p, 全功能, 目标40-50 FPS  
+# speed模式: 720p, 简化绘制, 目标50+ FPS
+# 注意: 实际分辨率由Orbbec相机决定，此处仅用于参考
+
