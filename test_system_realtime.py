@@ -1158,6 +1158,11 @@ class RealtimeVehicleDetection:
         self.fps = 0
         self.alerts = []  # 报警记录
         
+        # 警报去重机制：记录最近处理的车辆位置，防止重复警报
+        self.recent_alerts = []  # [(track_id, bbox, timestamp), ...]
+        self.alert_dedup_time_window = 30.0  # 30秒内的重复警报会被忽略
+        self.alert_dedup_iou_threshold = 0.5  # IoU > 0.5认为是同一辆车
+        
         # 检测结果数据库（可选）
         self.detection_db = None
         db_path = paths_cfg.get('detection_db_path', 'detection_results.db')
@@ -1171,6 +1176,26 @@ class RealtimeVehicleDetection:
                 print(f"\n【9. 检测结果数据库】")
                 print(f"⚠ 数据库初始化失败: {e}")
                 self.detection_db = None
+        
+        # 数据留存管理器（可选）
+        self.data_retention_manager = None
+        try:
+            data_retention_cfg = self.config.get('data_retention', {})
+            if data_retention_cfg:
+                from python_apps.data_retention_manager import DataRetentionManager
+                self.data_retention_manager = DataRetentionManager(
+                    data_retention_cfg,
+                    detection_db=self.detection_db
+                )
+                self.data_retention_manager.set_snapshot_dir(self.snapshot_dir)
+                print("\n【10. 初始化数据留存管理器】")
+                print(f"✓ 数据留存管理器初始化完成")
+                print(f"  数据库: 最大{data_retention_cfg.get('database', {}).get('max_records', 10000)}条记录，保留{data_retention_cfg.get('database', {}).get('retention_days', 30)}天")
+                print(f"  快照: 最大{data_retention_cfg.get('snapshots', {}).get('max_count', 1000)}张，{data_retention_cfg.get('snapshots', {}).get('max_size_mb', 500)}MB，保留{data_retention_cfg.get('snapshots', {}).get('retention_days', 7)}天")
+        except Exception as e:
+            print(f"\n【10. 数据留存管理器】")
+            print(f"⚠ 数据留存管理器初始化失败: {e}")
+            self.data_retention_manager = None
         
         # 帧共享（用于录制脚本）
         self.shared_frame_file = paths_cfg['shared_frame_file']
@@ -1203,8 +1228,48 @@ class RealtimeVehicleDetection:
         print("\n【8. 初始化云端集成】")
         self.cloud_integration = None
         self.snapshot_dir = paths_cfg.get('snapshot_dir', '/tmp/vehicle_snapshots')
+        
+        # #region agent log
+        try:
+            import json
+            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({
+                    'id': f'log_{int(time.time() * 1000)}',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'test_system_realtime.py:__init__',
+                    'message': 'Cloud integration init start',
+                    'data': {
+                        'CLOUD_AVAILABLE': CLOUD_AVAILABLE,
+                        'hypothesisId': 'A'
+                    },
+                    'sessionId': 'debug-session',
+                    'runId': 'run1'
+                }) + '\n')
+        except: pass
+        # #endregion
+        
         if CLOUD_AVAILABLE:
             cloud_cfg = self.config.get_cloud()
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:__init__',
+                        'message': 'Cloud config loaded',
+                        'data': {
+                            'cloud_enabled': cloud_cfg.get('enabled', False),
+                            'api_base_url': cloud_cfg.get('api_base_url', 'N/A'),
+                            'enable_alert_upload': cloud_cfg.get('enable_alert_upload', False),
+                            'hypothesisId': 'A'
+                        },
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             if cloud_cfg.get('enabled', False):
                 try:
                     cloud_config = CloudConfig(
@@ -1215,8 +1280,12 @@ class RealtimeVehicleDetection:
                         enable_image_upload=cloud_cfg.get('enable_image_upload', True),
                         enable_alert_upload=cloud_cfg.get('enable_alert_upload', True),
                         retry_attempts=cloud_cfg.get('retry_attempts', 3),
-                        retry_delay=cloud_cfg.get('retry_delay', 2.0)
+                        retry_delay=cloud_cfg.get('retry_delay', 2.0),
+                        save_snapshots=cloud_cfg.get('save_snapshots', True)
                     )
+                    # 添加监控截图配置（从config.yaml读取）
+                    cloud_config.monitoring_snapshot_interval = cloud_cfg.get('monitoring_snapshot_interval', 600)
+                    cloud_config.enable_monitoring_snapshot = cloud_cfg.get('enable_monitoring_snapshot', True)
                     self.cloud_integration = SentinelIntegration(cloud_config)
                     
                     # 设置统计信息回调函数（延迟到run方法中设置，因为tracks在运行时才存在）
@@ -1233,6 +1302,26 @@ class RealtimeVehicleDetection:
                     
                     self.cloud_integration.start()
                     
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'test_system_realtime.py:__init__',
+                                'message': 'Cloud integration started',
+                                'data': {
+                                    'cloud_integration_not_none': self.cloud_integration is not None,
+                                    'running': self.cloud_integration.running if self.cloud_integration else False,
+                                    'hypothesisId': 'A'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
+                    
                     # 创建快照目录
                     os.makedirs(self.snapshot_dir, exist_ok=True)
                     
@@ -1245,6 +1334,24 @@ class RealtimeVehicleDetection:
                     else:
                         print(f"⚠ 云端服务器连接失败，但将继续尝试上传")
                 except Exception as e:
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'test_system_realtime.py:__init__',
+                                'message': 'Cloud integration init failed',
+                                'data': {
+                                    'error': str(e),
+                                    'hypothesisId': 'A'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
                     print(f"⚠ 云端集成启动失败: {e}")
                     self.cloud_integration = None
             else:
@@ -1337,7 +1444,44 @@ class RealtimeVehicleDetection:
             frame: 原始帧（RGB格式，来自Orbbec相机）
             bbox: 边界框 (x1, y1, x2, y2)
         """
+        # #region agent log
+        try:
+            import json
+            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({
+                    'id': f'log_{int(time.time() * 1000)}',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                    'message': 'Function entry',
+                    'data': {
+                        'track_id': alert.get('track_id'),
+                        'vehicle_type': alert.get('type'),
+                        'class_name': alert.get('detected_class'),
+                        'has_cloud_integration': self.cloud_integration is not None,
+                        'hypothesisId': 'A'
+                    },
+                    'sessionId': 'debug-session',
+                    'runId': 'run1'
+                }) + '\n')
+        except: pass
+        # #endregion
+        
         if not self.cloud_integration:
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                        'message': 'cloud_integration is None, returning early',
+                        'data': {'hypothesisId': 'A'},
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             return
         
         try:
@@ -1390,9 +1534,38 @@ class RealtimeVehicleDetection:
                 cv2.imwrite(snapshot_path, snapshot)
             
             # 创建检测结果并上传
+            # 确保detected_class字段存在（优先使用detected_class，其次detected_type，最后class_name）
+            # 注意：alert字典中可能使用detected_class、detected_type或class_name字段
+            detected_class_value = (alert.get('detected_class') or 
+                                  alert.get('detected_type') or 
+                                  alert.get('class_name') or
+                                  'unknown')
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                        'message': 'Creating DetectionResult',
+                        'data': {
+                            'track_id': alert.get('track_id'),
+                            'detected_class_value': detected_class_value,
+                            'alert_keys': list(alert.keys()),
+                            'has_detected_class': 'detected_class' in alert,
+                            'has_detected_type': 'detected_type' in alert,
+                            'has_class_name': 'class_name' in alert,
+                            'hypothesisId': 'C'
+                        },
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             detection_result = DetectionResult(
                 vehicle_type=alert.get('type', 'Unknown'),
-                detected_class=alert.get('detected_type') or alert.get('detected_class'),
+                detected_class=detected_class_value,
                 status=alert.get('status'),
                 confidence=alert.get('confidence', 0.0),
                 plate_number=alert.get('plate_number') or alert.get('plate'),
@@ -1411,10 +1584,133 @@ class RealtimeVehicleDetection:
                 } if alert.get('rssi') is not None or alert.get('match_cost') is not None else None
             )
             
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                        'message': 'Before calling on_detection',
+                        'data': {
+                            'track_id': detection_result.track_id,
+                            'vehicle_type': detection_result.vehicle_type,
+                            'snapshot_path': snapshot_path,
+                            'hypothesisId': 'C'
+                        },
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
+            
             self.cloud_integration.on_detection(detection_result)
             
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                        'message': 'After calling on_detection',
+                        'data': {'track_id': detection_result.track_id, 'hypothesisId': 'C'},
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
+            
         except Exception as e:
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'test_system_realtime.py:_save_snapshot_and_upload',
+                        'message': 'Exception in _save_snapshot_and_upload',
+                        'data': {'error': str(e), 'hypothesisId': 'C'},
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             print(f"⚠ 保存快照或上传失败: {e}")
+    
+    def _is_duplicate_alert(self, track_id, bbox, current_time, class_name=None):
+        """
+        检查是否是重复警报（基于位置、时间和类别）
+        
+        Args:
+            track_id: 当前track ID
+            bbox: 边界框 [x1, y1, x2, y2]
+            current_time: 当前时间戳
+            class_name: 当前类别（可选，用于类别区分）
+            
+        Returns:
+            bool: 如果是重复警报返回True
+        """
+        # 清理过期记录（超过时间窗口的记录）
+        self.recent_alerts = [
+            (tid, b, t, cls) for tid, b, t, cls in self.recent_alerts
+            if current_time - t < self.alert_dedup_time_window
+        ]
+        
+        # 检查是否有重叠的警报（基于位置和类别）
+        for existing_track_id, existing_bbox, existing_time, existing_class in self.recent_alerts:
+            # 如果是同一个track_id，直接返回True（已处理过）
+            if existing_track_id == track_id:
+                return True
+            
+            # 如果类别不同，不认为是重复（允许不同类别的车辆在同一位置）
+            if class_name and existing_class and class_name != existing_class:
+                continue
+            
+            # 如果位置重叠且时间接近，认为是同一辆车（跟踪ID切换导致）
+            iou = self._compute_bbox_iou(bbox, existing_bbox)
+            time_diff = current_time - existing_time
+            
+            if iou > self.alert_dedup_iou_threshold and time_diff < 10.0:
+                # 位置重叠且时间接近（10秒内），可能是跟踪ID切换导致的重复
+                print(f"  ⚠ 检测到重复警报：Track#{track_id} ({class_name}) 与 Track#{existing_track_id} ({existing_class}) 位置重叠（IoU={iou:.2f}，时间差={time_diff:.1f}s）")
+                return True
+        
+        # 不在这里记录，而是在成功创建alert并上传后才记录（避免批量处理时被误判为重复）
+        # self.recent_alerts.append((track_id, bbox, current_time, class_name))
+        return False
+    
+    def _compute_bbox_iou(self, box1, box2):
+        """
+        计算两个bbox的IoU
+        
+        Args:
+            box1: [x1, y1, x2, y2]
+            box2: [x1, y1, x2, y2]
+            
+        Returns:
+            float: IoU值
+        """
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0.0
     
     def process_new_vehicle(self, track_id, vehicle_type, bbox, image, class_name=None, detection_confidence=0.0):
         """处理新检测到的车辆"""
@@ -1892,16 +2188,24 @@ class RealtimeVehicleDetection:
         if self.cloud_whitelist_manager:
             import threading
             def update_whitelist_periodically():
-                """定期更新白名单"""
+                """定期更新白名单（后台线程，每N秒更新一次）"""
                 while True:
                     try:
+                        # 等待更新间隔
                         time.sleep(self.cloud_whitelist_manager.update_interval)
+                        
+                        # 从云端获取最新白名单
                         if self.cloud_whitelist_manager.fetch_whitelist():
-                            # 更新BeaconFilter中的白名单
+                            # 更新BeaconFilter中的白名单（强制刷新）
                             if self.beacon_filter:
-                                self.beacon_filter.refresh_whitelist()
+                                self.beacon_filter.refresh_whitelist(force_update=False)  # 已经fetch了，不需要再次fetch
+                            print(f"  ✅ 白名单已自动更新: {len(self.cloud_whitelist_manager.whitelist)} 个信标")
+                        else:
+                            print(f"  ⚠️  白名单自动更新失败，使用缓存数据")
                     except Exception as e:
                         print(f"⚠ 白名单更新线程错误: {e}")
+                        import traceback
+                        traceback.print_exc()
             
             whitelist_update_thread = threading.Thread(
                 target=update_whitelist_periodically, 
@@ -1909,6 +2213,7 @@ class RealtimeVehicleDetection:
             )
             whitelist_update_thread.start()
             print(f"✅ 云端白名单更新线程已启动（每{self.cloud_whitelist_manager.update_interval}秒更新一次）")
+            print(f"   💡 提示：前端配置信标后，最多等待{self.cloud_whitelist_manager.update_interval}秒即可生效")
         print("按 'q' 退出\n")
         
         fps_start_time = time.time()
@@ -1928,6 +2233,21 @@ class RealtimeVehicleDetection:
                     'queue_size': self.cloud_integration.get_queue_size() if self.cloud_integration else 0
                 }
             self.cloud_integration.set_stats_callback(get_stats_with_tracks)
+        
+        # 设置帧回调函数（用于定时上传监控截图）
+        if self.cloud_integration and self.depth_camera:
+            def get_current_frame():
+                """获取当前帧的回调函数"""
+                try:
+                    # 获取当前彩色帧
+                    frame = self.depth_camera.get_color_frame()
+                    return frame
+                except Exception as e:
+                    print(f"⚠ 获取帧失败: {e}")
+                    return None
+            
+            self.cloud_integration.set_frame_callback(get_current_frame)
+            print("[云端集成] 帧回调函数已设置（用于监控截图）")
         
         # 启动硬件监控线程
         if self.hardware_recovery:
@@ -2018,6 +2338,27 @@ class RealtimeVehicleDetection:
                 #     if class_name in VEHICLE_CLASSES:
                 #         vehicle_indices.append(i)
                 
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'test_system_realtime.py:run',
+                            'message': 'After postprocess',
+                            'data': {
+                                'total_detections': len(boxes),
+                                'vehicle_indices_count': len(vehicle_indices),
+                                'frame_count': self.frame_count,
+                                'hypothesisId': 'A'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
+                
                 if len(vehicle_indices) > 0:
                     vehicle_boxes = boxes[vehicle_indices]
                     vehicle_class_ids = class_ids[vehicle_indices]
@@ -2047,10 +2388,72 @@ class RealtimeVehicleDetection:
                 new_construction_vehicles = []  # 收集新的工程车辆
                 new_civilian_vehicles = []  # 收集新的社会车辆
                 
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'test_system_realtime.py:run',
+                            'message': 'Processing tracks',
+                            'data': {
+                                'total_tracks': len(tracks),
+                                'alerts_dict_size': len(alerts_dict),
+                                'has_cloud_integration': self.cloud_integration is not None,
+                                'hypothesisId': 'A'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
+                
                 for track_id, track in tracks.items():
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'test_system_realtime.py:run',
+                                'message': 'Processing track in loop',
+                                'data': {
+                                    'track_id': track_id,
+                                    'processed': track.get('processed', False),
+                                    'in_alerts_dict': track_id in alerts_dict,
+                                    'class_id': track.get('class'),
+                                    'hypothesisId': 'B'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
                     if not track['processed'] and track_id not in alerts_dict:
                         class_name = CUSTOM_CLASSES.get(track['class'], 'unknown')
                         vehicle_type = VEHICLE_CLASSES.get(class_name, 'construction')  # 默认工程车辆
+                        # #region agent log
+                        try:
+                            import json
+                            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({
+                                    'id': f'log_{int(time.time() * 1000)}',
+                                    'timestamp': int(time.time() * 1000),
+                                    'location': 'test_system_realtime.py:run',
+                                    'message': 'Track passed initial check',
+                                    'data': {
+                                        'track_id': track_id,
+                                        'class_name': class_name,
+                                        'vehicle_type': vehicle_type,
+                                        'hypothesisId': 'B'
+                                    },
+                                    'sessionId': 'debug-session',
+                                    'runId': 'run1'
+                                }) + '\n')
+                        except: pass
+                        # #endregion
                         
                         # 缩放bbox到原图
                         h, w = frame.shape[:2]
@@ -2063,10 +2466,76 @@ class RealtimeVehicleDetection:
                             bbox[3] * h / input_h
                         ]
                         
+                        # 获取检测置信度
+                        detection_confidence = track.get('confidence', track.get('score', 0.0))
+                        
+                        # 增加置信度阈值检查（减少误识别）
+                        if detection_confidence < 0.7:  # 提高阈值，减少低置信度的误识别
+                            print(f"  ⚠ 置信度过低({detection_confidence:.2f})，跳过: Track#{track_id} ({class_name})")
+                            # 标记为已处理，避免重复
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(track_id)
+                            else:
+                                track['processed'] = True
+                            continue
+                        
+                        # 检查是否是重复警报（基于位置、时间和类别去重）
+                        current_time = time.time()
+                        is_duplicate = self._is_duplicate_alert(track_id, bbox_scaled, current_time, class_name=class_name)
+                        # #region agent log
+                        try:
+                            import json
+                            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({
+                                    'id': f'log_{int(time.time() * 1000)}',
+                                    'timestamp': int(time.time() * 1000),
+                                    'location': 'test_system_realtime.py:run',
+                                    'message': 'Checking duplicate alert',
+                                    'data': {
+                                        'track_id': track_id,
+                                        'class_name': class_name,
+                                        'is_duplicate': is_duplicate,
+                                        'hypothesisId': 'B'
+                                    },
+                                    'sessionId': 'debug-session',
+                                    'runId': 'run1'
+                                }) + '\n')
+                        except: pass
+                        # #endregion
+                        if is_duplicate:
+                            print(f"  ⏭ 跳过重复警报：Track#{track_id} ({class_name})")
+                            # 标记为已处理，避免重复
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(track_id)
+                            else:
+                                track['processed'] = True
+                            continue
+                        
                         if vehicle_type == 'construction':
                             # 收集工程车辆信息，稍后批量处理
                             # 获取检测置信度（从track中获取，ByteTracker使用'score'，VehicleTracker使用'confidence'）
                             detection_confidence = track.get('confidence', track.get('score', 0.0))
+                            # #region agent log
+                            try:
+                                import json
+                                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({
+                                        'id': f'log_{int(time.time() * 1000)}',
+                                        'timestamp': int(time.time() * 1000),
+                                        'location': 'test_system_realtime.py:run',
+                                        'message': 'Adding construction vehicle to batch list',
+                                        'data': {
+                                            'track_id': track_id,
+                                            'class_name': class_name,
+                                            'vehicle_type': vehicle_type,
+                                            'confidence': float(detection_confidence) if detection_confidence is not None else None,
+                                            'hypothesisId': 'B'
+                                        },
+                                        'sessionId': 'debug-session',
+                                        'runId': 'run1'
+                                    }) + '\n')
+                            except: pass
+                            # #endregion
                             new_construction_vehicles.append({
                                 'track_id': track_id,
                                 'bbox': bbox_scaled,
@@ -2074,6 +2543,11 @@ class RealtimeVehicleDetection:
                                 'image': frame,
                                 'confidence': detection_confidence  # 添加检测置信度
                             })
+                            # 标记为已处理，避免在单次循环中重复处理
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(track_id)
+                            else:
+                                track['processed'] = True
                         else:
                             # 社会车辆：提交异步识别任务
                             if self.async_lpr:
@@ -2119,8 +2593,11 @@ class RealtimeVehicleDetection:
                                         alert['db_id'] = record_id
                                     except Exception as e:
                                         print(f"⚠ 保存检测结果到数据库失败: {e}")
-                                # 保存快照并上传到云端
-                                self._save_snapshot_and_upload(alert, frame, bbox_scaled)
+                                    # 保存快照并上传到云端
+                                    self._save_snapshot_and_upload(alert, frame, bbox_scaled)
+                                    # 上传成功后才记录到recent_alerts，避免后续被误判为重复
+                                    current_time = time.time()
+                                    self.recent_alerts.append((track_id, bbox_scaled, current_time, class_name))
                             else:
                                 # 无异步处理器，使用同步处理
                                 # 获取检测置信度（从track中获取，ByteTracker使用'score'，VehicleTracker使用'confidence'）
@@ -2131,6 +2608,9 @@ class RealtimeVehicleDetection:
                                     self.alerts.append(alert)
                                     # 保存快照并上传到云端
                                     self._save_snapshot_and_upload(alert, frame, bbox_scaled)
+                                    # 上传成功后才记录到recent_alerts，避免后续被误判为重复
+                                    current_time = time.time()
+                                    self.recent_alerts.append((track_id, bbox_scaled, current_time, class_name))
                             
                             # 标记为已处理
                             if hasattr(self.tracker, 'mark_processed'):
@@ -2157,8 +2637,46 @@ class RealtimeVehicleDetection:
                                 alert['message'] = f"社会车辆（未识别车牌）"
                 
                 # 批量处理工程车辆（使用多目标匹配）
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'test_system_realtime.py:run',
+                            'message': 'Before batch processing construction vehicles',
+                            'data': {
+                                'new_construction_vehicles_count': len(new_construction_vehicles),
+                                'has_beacon_client': self.beacon_client is not None,
+                                'has_beacon_filter': self.beacon_filter is not None,
+                                'hypothesisId': 'B'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
                 if new_construction_vehicles and self.beacon_client and self.beacon_filter:
                     all_beacons = self.beacon_client.get_beacons()
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'test_system_realtime.py:run',
+                                'message': 'Got beacons for batch processing',
+                                'data': {
+                                    'beacons_count': len(all_beacons) if all_beacons else 0,
+                                    'hypothesisId': 'B'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
                     if all_beacons and len(new_construction_vehicles) > 0:
                         # 准备车辆信息（包含深度）
                         vehicles_info = []
@@ -2192,7 +2710,41 @@ class RealtimeVehicleDetection:
                             
                             # 处理匹配结果
                             for i, vehicle in enumerate(new_construction_vehicles):
+                                # 检查车辆是否已经在alerts_dict中（避免重复处理）
+                                if vehicle['track_id'] in alerts_dict:
+                                    print(f"  ⏭ 跳过已处理的车辆：Track#{vehicle['track_id']} ({vehicle['class_name']})")
+                                    continue
+                                
+                                # 检查是否是重复警报（基于位置、时间和类别去重）
+                                current_time = time.time()
+                                if self._is_duplicate_alert(vehicle['track_id'], vehicle['bbox'], current_time, class_name=vehicle['class_name']):
+                                    print(f"  ⏭ 跳过重复警报：Track#{vehicle['track_id']} ({vehicle['class_name']})")
+                                    # 标记为已处理
+                                    if hasattr(self.tracker, 'mark_processed'):
+                                        self.tracker.mark_processed(vehicle['track_id'])
+                                    continue
+                                
                                 match_result = match_results[i] if i < len(match_results) else None
+                                # #region agent log
+                                try:
+                                    import json
+                                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                        f.write(json.dumps({
+                                            'id': f'log_{int(time.time() * 1000)}',
+                                            'timestamp': int(time.time() * 1000),
+                                            'location': 'test_system_realtime.py:run',
+                                            'message': 'Match result for vehicle',
+                                            'data': {
+                                                'track_id': vehicle['track_id'],
+                                                'matched': match_result['matched'] if match_result else False,
+                                                'beacon_mac': match_result['beacon_info']['mac'] if (match_result and match_result.get('beacon_info')) else None,
+                                                'hypothesisId': 'B'
+                                            },
+                                            'sessionId': 'debug-session',
+                                            'runId': 'run1'
+                                        }) + '\n')
+                                except: pass
+                                # #endregion
                                 if match_result and match_result['matched']:
                                     # 有匹配，使用匹配结果
                                     alert = self._create_construction_alert(
@@ -2204,6 +2756,25 @@ class RealtimeVehicleDetection:
                                         match_result['cost'],
                                         detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
                                     )
+                                    # #region agent log
+                                    try:
+                                        import json
+                                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({
+                                                'id': f'log_{int(time.time() * 1000)}',
+                                                'timestamp': int(time.time() * 1000),
+                                                'location': 'test_system_realtime.py:run',
+                                                'message': 'Created construction alert (registered)',
+                                                'data': {
+                                                    'track_id': vehicle['track_id'],
+                                                    'alert_status': alert.get('status') if alert else None,
+                                                    'hypothesisId': 'B'
+                                                },
+                                                'sessionId': 'debug-session',
+                                                'runId': 'run1'
+                                            }) + '\n')
+                                    except: pass
+                                    # #endregion
                                 else:
                                     # 无匹配，标记为未备案（不再使用单目标匹配回退，因为信标数量限制已处理）
                                     print(f"  ⚠️  [匹配] Track {vehicle['track_id']} 无匹配，标记为未备案")
@@ -2248,19 +2819,66 @@ class RealtimeVehicleDetection:
                                             print(f"⚠ 保存检测结果到数据库失败: {e}")
                                     # 保存快照并上传到云端
                                     self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                                    # 上传成功后才记录到recent_alerts，避免后续被误判为重复
+                                    current_time = time.time()
+                                    self.recent_alerts.append((vehicle['track_id'], vehicle['bbox'], current_time, vehicle['class_name']))
                         else:
                             # 单个车辆，使用单目标匹配
                             vehicle = new_construction_vehicles[0]
-                            alert = self.check_construction_vehicle(
-                                vehicle['track_id'],
-                                vehicle['bbox'],
-                                vehicle['image'],
-                                detected_class=vehicle['class_name'],
-                                detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
-                            )
-                            if alert:
-                                alerts_dict[vehicle['track_id']] = alert
-                                self.alerts.append(alert)
+                            
+                            # 检查车辆是否已经在alerts_dict中（避免重复处理）
+                            if vehicle['track_id'] in alerts_dict:
+                                print(f"  ⏭ 跳过已处理的车辆：Track#{vehicle['track_id']} ({vehicle['class_name']})")
+                                continue
+                            
+                            # 检查是否是重复警报（基于位置、时间和类别去重）
+                            current_time = time.time()
+                            if self._is_duplicate_alert(vehicle['track_id'], vehicle['bbox'], current_time, class_name=vehicle['class_name']):
+                                print(f"  ⏭ 跳过重复警报：Track#{vehicle['track_id']} ({vehicle['class_name']})")
+                                # 标记为已处理
+                                if hasattr(self.tracker, 'mark_processed'):
+                                    self.tracker.mark_processed(vehicle['track_id'])
+                            else:
+                                alert = self.check_construction_vehicle(
+                                    vehicle['track_id'],
+                                    vehicle['bbox'],
+                                    vehicle['image'],
+                                    detected_class=vehicle['class_name'],
+                                    detection_confidence=vehicle.get('confidence', 0.0)  # 传递检测置信度
+                                )
+                                if alert:
+                                    alerts_dict[vehicle['track_id']] = alert
+                                    self.alerts.append(alert)
+                                    # 保存到数据库
+                                    if self.detection_db:
+                                        try:
+                                            detection_data = {
+                                                'timestamp': datetime.now().isoformat(),
+                                                'track_id': alert.get('track_id'),
+                                                'type': alert.get('type'),
+                                                'detected_class': vehicle['class_name'],
+                                                'status': alert.get('status'),
+                                                'beacon_mac': alert.get('beacon_mac'),
+                                                'plate_number': alert.get('plate_number'),
+                                                'company': alert.get('company'),
+                                                'distance': alert.get('distance'),
+                                                'confidence': alert.get('confidence', 0.0),
+                                                'bbox': vehicle['bbox'],
+                                                'snapshot_path': None,
+                                                'metadata': {
+                                                    'rssi': alert.get('rssi'),
+                                                    'match_cost': alert.get('match_cost')
+                                                }
+                                            }
+                                            record_id = self.detection_db.insert_detection(detection_data)
+                                            alert['db_id'] = record_id
+                                        except Exception as e:
+                                            print(f"⚠ 保存检测结果到数据库失败: {e}")
+                                    # 保存快照并上传到云端
+                                    self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                                    # 上传成功后才记录到recent_alerts，避免后续被误判为重复
+                                    current_time = time.time()
+                                    self.recent_alerts.append((vehicle['track_id'], vehicle['bbox'], current_time, vehicle['class_name']))
                                 # 保存到数据库
                                 if self.detection_db:
                                     try:
@@ -2296,6 +2914,15 @@ class RealtimeVehicleDetection:
                 elif new_construction_vehicles:
                     # 无信标客户端，逐个处理
                     for vehicle in new_construction_vehicles:
+                        # 检查是否是重复警报（基于位置、时间和类别去重）
+                        current_time = time.time()
+                        if self._is_duplicate_alert(vehicle['track_id'], vehicle['bbox'], current_time, class_name=vehicle['class_name']):
+                            print(f"  ⏭ 跳过重复警报：Track#{vehicle['track_id']} ({vehicle['class_name']})")
+                            # 标记为已处理
+                            if hasattr(self.tracker, 'mark_processed'):
+                                self.tracker.mark_processed(vehicle['track_id'])
+                            continue
+                        
                         alert = self.check_construction_vehicle(
                             vehicle['track_id'],
                             vehicle['bbox'],
@@ -2332,6 +2959,9 @@ class RealtimeVehicleDetection:
                                     print(f"⚠ 保存检测结果到数据库失败: {e}")
                             # 保存快照并上传到云端
                             self._save_snapshot_and_upload(alert, frame, vehicle['bbox'])
+                            # 上传成功后才记录到recent_alerts，避免后续被误判为重复
+                            current_time = time.time()
+                            self.recent_alerts.append((vehicle['track_id'], vehicle['bbox'], current_time, vehicle['class_name']))
                         if hasattr(self.tracker, 'mark_processed'):
                             self.tracker.mark_processed(vehicle['track_id'])
                         else:

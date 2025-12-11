@@ -238,3 +238,4 @@ sudo systemctl start vehicle-detection
 **状态**: ⚠️ 代码已修复（本地），需要确认部署状态并重启服务  
 **下一步**: 检查Jetson端代码部署状态，必要时重启服务
 
+

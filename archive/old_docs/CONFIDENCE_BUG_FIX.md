@@ -109,3 +109,4 @@ detection_confidence = track.get('confidence', track.get('score', 0.0))
 **状态**: ✅ 已修复  
 **下一步**: 重启服务并验证修复效果
 
+

@@ -159,3 +159,5 @@ Image compressed: XXX KB -> YYY KB (size: 1920x1080)
 
 所有优化已完成，前端现在应该能接收到更高分辨率的图像。
 
+
+

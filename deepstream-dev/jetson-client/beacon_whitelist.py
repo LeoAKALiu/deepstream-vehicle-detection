@@ -205,13 +205,12 @@ class BeaconWhitelistManager:
             return self.fetch_whitelist()
         return self.last_update_success
     
-    def match_beacon(self, mac_address: str, force_update: bool = False) -> Optional[BeaconEntry]:
+    def match_beacon(self, mac_address: str) -> Optional[BeaconEntry]:
         """
         匹配信标MAC地址
         
         Args:
             mac_address: 信标MAC地址（支持多种格式）
-            force_update: 是否强制更新白名单（用于实时获取最新配置）
         
         Returns:
             BeaconEntry: 匹配的信标条目，如果未匹配返回None
@@ -219,9 +218,8 @@ class BeaconWhitelistManager:
         # 标准化MAC地址格式
         normalized_mac = BeaconEntry._normalize_mac(mac_address)
         
-        # 如果强制更新或需要更新，则更新白名单
-        if force_update or self.should_update():
-            self.fetch_whitelist()
+        # 确保白名单是最新的
+        self.auto_update()
         
         return self.whitelist.get(normalized_mac)
     
@@ -247,20 +245,14 @@ class BeaconWhitelistManager:
         """
         return self.match_beacon(mac_address) is not None
     
-    def get_whitelist_dict(self, force_update: bool = False) -> Dict[str, Dict]:
+    def get_whitelist_dict(self) -> Dict[str, Dict]:
         """
         获取白名单字典（兼容BeaconFilter格式）
-        
-        Args:
-            force_update: 是否强制更新白名单（用于实时获取最新配置）
         
         Returns:
             Dict[str, Dict]: MAC地址 -> 信标信息字典
         """
-        # 如果强制更新或需要更新，则更新白名单
-        if force_update or self.should_update():
-            self.fetch_whitelist()
-        
+        self.auto_update()
         return {mac: entry.to_dict() for mac, entry in self.whitelist.items()}
     
     def get_stats(self) -> Dict:

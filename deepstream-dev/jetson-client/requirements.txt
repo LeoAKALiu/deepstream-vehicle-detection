@@ -1,0 +1,14 @@
+# Jetson 客户端依赖
+# 注意：如果系统已安装这些包，可以跳过安装
+# 当前系统已安装版本：
+#   requests: 2.25.1 (最低要求: 2.25.0)
+#   Pillow: 9.0.1 (最低要求: 9.0.0)
+#   opencv: 4.11.0 (最低要求: 4.8.0)
+#   numpy: 1.26.1 (最低要求: 1.24.0)
+
+requests>=2.25.0  # 已安装: 2.25.1 ✅
+Pillow>=9.0.0     # 已安装: 9.0.1 ✅
+# opencv-python-headless>=4.8.0  # 可选：系统已安装opencv-python 4.11.0，无需headless版本
+# 注意：opencv-python-headless 是轻量级版本（无GUI支持），但系统已有opencv-python可用
+numpy>=1.24.0     # 已安装: 1.26.1 ✅
+

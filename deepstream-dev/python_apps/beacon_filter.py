@@ -93,18 +93,12 @@ class BeaconFilter:
         with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     
-    def _build_whitelist(self, force_update: bool = False) -> Dict[str, dict]:
-        """
-        构建白名单字典（优先使用云端白名单）
-        
-        Args:
-            force_update: 是否强制从云端更新（True=立即获取最新，False=使用缓存）
-        """
+    def _build_whitelist(self) -> Dict[str, dict]:
+        """构建白名单字典（优先使用云端白名单）"""
         # 如果使用云端白名单，从云端获取
         if self.use_cloud_whitelist and self.cloud_whitelist_manager:
             try:
-                # 获取白名单字典（如果force_update=True，会强制从云端获取最新）
-                cloud_whitelist = self.cloud_whitelist_manager.get_whitelist_dict(force_update=force_update)
+                cloud_whitelist = self.cloud_whitelist_manager.get_whitelist_dict()
                 if cloud_whitelist:
                     print(f"  ✅ 从云端获取白名单: {len(cloud_whitelist)} 个信标")
                     return cloud_whitelist
@@ -129,23 +123,10 @@ class BeaconFilter:
         
         return whitelist
     
-    def refresh_whitelist(self, force_update: bool = True):
-        """
-        刷新白名单（从云端重新获取）
-        
-        Args:
-            force_update: 是否强制更新（True=立即从云端获取最新，False=仅在需要时更新）
-        """
+    def refresh_whitelist(self):
+        """刷新白名单（从云端重新获取）"""
         if self.use_cloud_whitelist and self.cloud_whitelist_manager:
-            # 强制从云端获取最新白名单
-            if force_update:
-                success = self.cloud_whitelist_manager.fetch_whitelist()
-                if success:
-                    print(f"  📡 已从云端获取最新白名单")
-                else:
-                    print(f"  ⚠️  从云端获取白名单失败，使用缓存数据")
-            # 重新构建白名单字典
-            self.whitelist = self._build_whitelist(force_update=False)  # 已经fetch了，不需要再次fetch
+            self.whitelist = self._build_whitelist()
             print(f"  ✅ 白名单已刷新: {len(self.whitelist)} 个信标")
     
     def filter_beacons(

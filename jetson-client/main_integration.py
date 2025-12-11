@@ -27,6 +27,11 @@ class SentinelIntegration:
             config: 云端配置，如果为 None 则从环境变量加载
         """
         self.config = config or load_config()
+        
+        # 从CloudConfig加载监控截图配置（如果已设置）
+        self.monitoring_snapshot_interval = getattr(self.config, 'monitoring_snapshot_interval', 600)
+        self.enable_monitoring_snapshot = getattr(self.config, 'enable_monitoring_snapshot', True)
+        
         self.cloud_client = CloudClient(self.config)
         self.detection_queue = queue.Queue(maxsize=100)
         self.running = False
@@ -35,6 +40,8 @@ class SentinelIntegration:
         self.heartbeat_interval = 300  # 5分钟
         self.device_id = os.getenv("DEVICE_ID", "jetson-01")
         self.stats_callback: Optional[callable] = None  # 用于获取统计信息的回调函数
+        self.frame_callback: Optional[callable] = None  # 用于获取当前帧的回调函数
+        self.monitoring_snapshot_thread: Optional[threading.Thread] = None
         
         # 设置日志
         if not logging.getLogger().handlers:
@@ -53,9 +60,35 @@ class SentinelIntegration:
         self.upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
         self.upload_thread.start()
         
+        # #region agent log
+        try:
+            import json
+            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({
+                    'id': f'log_{int(time.time() * 1000)}',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'main_integration.py:start',
+                    'message': 'Upload thread started',
+                    'data': {
+                        'thread_alive': self.upload_thread.is_alive() if self.upload_thread else False,
+                        'running': self.running,
+                        'hypothesisId': 'D'
+                    },
+                    'sessionId': 'debug-session',
+                    'runId': 'run1'
+                }) + '\n')
+        except: pass
+        # #endregion
+        
         # 启动心跳线程
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
         self.heartbeat_thread.start()
+        
+        # 启动监控截图线程（如果启用）
+        if self.enable_monitoring_snapshot:
+            self.monitoring_snapshot_thread = threading.Thread(target=self._monitoring_snapshot_worker, daemon=True)
+            self.monitoring_snapshot_thread.start()
+            logger.info(f"Monitoring snapshot worker started (interval: {self.monitoring_snapshot_interval}s)")
         
         logger.info("Sentinel integration started")
     
@@ -73,33 +106,209 @@ class SentinelIntegration:
         Args:
             detection: 检测结果
         """
+        # #region agent log
+        try:
+            import json
+            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({
+                    'id': f'log_{int(time.time() * 1000)}',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'main_integration.py:on_detection',
+                    'message': 'Function entry',
+                    'data': {
+                        'track_id': detection.track_id,
+                        'vehicle_type': detection.vehicle_type,
+                        'queue_size_before': self.detection_queue.qsize(),
+                        'queue_maxsize': self.detection_queue.maxsize,
+                        'hypothesisId': 'D'
+                    },
+                    'sessionId': 'debug-session',
+                    'runId': 'run1'
+                }) + '\n')
+        except: pass
+        # #endregion
         try:
             # 添加到上传队列
             self.detection_queue.put_nowait(detection)
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'main_integration.py:on_detection',
+                        'message': 'Detection queued successfully',
+                        'data': {
+                            'track_id': detection.track_id,
+                            'queue_size_after': self.detection_queue.qsize(),
+                            'hypothesisId': 'D'
+                        },
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             logger.debug(f"Detection queued: {detection.vehicle_type} (conf: {detection.confidence:.2f})")
         except queue.Full:
+            # #region agent log
+            try:
+                import json
+                with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        'id': f'log_{int(time.time() * 1000)}',
+                        'timestamp': int(time.time() * 1000),
+                        'location': 'main_integration.py:on_detection',
+                        'message': 'Queue is full, dropping detection',
+                        'data': {
+                            'track_id': detection.track_id,
+                            'queue_size': self.detection_queue.qsize(),
+                            'hypothesisId': 'D'
+                        },
+                        'sessionId': 'debug-session',
+                        'runId': 'run1'
+                    }) + '\n')
+            except: pass
+            # #endregion
             logger.warning("Detection queue is full, dropping detection")
     
     def _upload_worker(self) -> None:
         """上传工作线程"""
+        # #region agent log
+        try:
+            import json
+            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({
+                    'id': f'log_{int(time.time() * 1000)}',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'main_integration.py:_upload_worker',
+                    'message': 'Upload worker started',
+                    'data': {'running': self.running, 'hypothesisId': 'D'},
+                    'sessionId': 'debug-session',
+                    'runId': 'run1'
+                }) + '\n')
+        except: pass
+        # #endregion
         while self.running:
             try:
                 # 从队列获取检测结果（阻塞，最多等待1秒）
                 try:
                     detection = self.detection_queue.get(timeout=1.0)
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'main_integration.py:_upload_worker',
+                                'message': 'Got detection from queue',
+                                'data': {
+                                    'track_id': detection.track_id,
+                                    'vehicle_type': detection.vehicle_type,
+                                    'queue_size_after_get': self.detection_queue.qsize(),
+                                    'hypothesisId': 'D'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
                 except queue.Empty:
                     continue
                 
                 # 先上传图片（如果存在），获取图片URL
                 snapshot_url = None
                 if detection.image_path and Path(detection.image_path).exists():
-                    # 先上传图片，获取URL
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'main_integration.py:_upload_worker',
+                                'message': 'Before upload_image',
+                                'data': {
+                                    'track_id': detection.track_id,
+                                    'image_path': detection.image_path,
+                                    'hypothesisId': 'E'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
+                    # 先上传图片，获取URL（返回相对路径，格式：YYYY-MM-DD/filename）
                     snapshot_url = self.cloud_client.upload_image(
                         image_path=detection.image_path,
                         alert_id=None  # 先不上传，稍后通过alert_id关联
                     )
+                    # #region agent log
+                    try:
+                        import json
+                        with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({
+                                'id': f'log_{int(time.time() * 1000)}',
+                                'timestamp': int(time.time() * 1000),
+                                'location': 'main_integration.py:_upload_worker',
+                                'message': 'After upload_image',
+                                'data': {
+                                    'track_id': detection.track_id,
+                                    'snapshot_url': snapshot_url,
+                                    'hypothesisId': 'E'
+                                },
+                                'sessionId': 'debug-session',
+                                'runId': 'run1'
+                            }) + '\n')
+                    except: pass
+                    # #endregion
                 
                 # 上传警报（包含图片URL）
+                # 根据云端要求：
+                # - snapshot_url: 使用上传接口返回的path（相对路径，格式：YYYY-MM-DD/filename）✅
+                # - snapshot_path: 不应使用Jetson端绝对路径，如果snapshot_url存在则设为None
+                # - image_path: 不应使用Jetson端绝对路径，如果snapshot_url存在则设为None
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'main_integration.py:_upload_worker',
+                            'message': 'Before send_alert',
+                            'data': {
+                                'track_id': detection.track_id,
+                                'vehicle_type': detection.vehicle_type,
+                                'hypothesisId': 'E'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'main_integration.py:_upload_worker',
+                            'message': 'Before send_alert with detected_class',
+                            'data': {
+                                'track_id': detection.track_id,
+                                'detected_class': detection.detected_class,
+                                'vehicle_type': detection.vehicle_type,
+                                'status': detection.status,
+                                'hypothesisId': 'E'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
                 alert_id = self.cloud_client.send_alert(
                     vehicle_type=detection.vehicle_type,
                     timestamp=detection.timestamp,
@@ -120,10 +329,30 @@ class SentinelIntegration:
                     company=detection.company,
                     environment_code=detection.environment_code,  # 添加环境编码
                     metadata=detection.metadata,
-                    snapshot_path=detection.image_path,  # 本地路径
-                    snapshot_url=snapshot_url,  # 云端URL
-                    image_path=detection.image_path  # 备用字段
+                    snapshot_path=None,  # 必须为null（文档要求）
+                    snapshot_url=snapshot_url,  # 使用上传接口返回的相对路径（格式：YYYY-MM-DD/filename）
+                    image_path=None  # 必须为null（文档要求）
                 )
+                
+                # #region agent log
+                try:
+                    import json
+                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({
+                            'id': f'log_{int(time.time() * 1000)}',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'main_integration.py:_upload_worker',
+                            'message': 'After send_alert',
+                            'data': {
+                                'track_id': detection.track_id,
+                                'alert_id': alert_id,
+                                'hypothesisId': 'E'
+                            },
+                            'sessionId': 'debug-session',
+                            'runId': 'run1'
+                        }) + '\n')
+                except: pass
+                # #endregion
                 
                 # 如果图片上传成功但alert_id已返回，再次关联图片和alert
                 if snapshot_url and alert_id:
@@ -165,6 +394,15 @@ class SentinelIntegration:
             callback: 返回统计信息字典的函数
         """
         self.stats_callback = callback
+    
+    def set_frame_callback(self, callback: Callable[[], Optional[Any]]) -> None:
+        """
+        设置帧获取回调函数
+        
+        Args:
+            callback: 返回当前帧（numpy数组）的函数，如果没有帧则返回None
+        """
+        self.frame_callback = callback
     
     def _get_system_status(self) -> Dict[str, Any]:
         """
@@ -243,4 +481,94 @@ class SentinelIntegration:
             except Exception as e:
                 logger.error(f"Error in heartbeat worker: {e}")
                 time.sleep(self.heartbeat_interval)
+    
+    def _monitoring_snapshot_worker(self) -> None:
+        """监控截图工作线程（定时上传现场高清截图）"""
+        import cv2
+        import tempfile
+        
+        while self.running:
+            try:
+                # 等待指定间隔
+                time.sleep(self.monitoring_snapshot_interval)
+                
+                # 检查是否启用
+                if not self.enable_monitoring_snapshot:
+                    continue
+                
+                # 获取当前帧
+                if not self.frame_callback:
+                    logger.debug("Frame callback not set, skipping monitoring snapshot")
+                    continue
+                
+                try:
+                    frame = self.frame_callback()
+                    if frame is None:
+                        logger.debug("No frame available, skipping monitoring snapshot")
+                        continue
+                except Exception as e:
+                    logger.warning(f"Error getting frame for monitoring snapshot: {e}")
+                    continue
+                
+                # 保存为临时文件（高清，不压缩）
+                temp_dir = Path(tempfile.gettempdir())
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                snapshot_filename = f"monitoring_snapshot_{self.device_id}_{timestamp}.jpg"
+                snapshot_path = temp_dir / snapshot_filename
+                
+                try:
+                    # 确保是BGR格式（OpenCV格式）
+                    if len(frame.shape) == 3:
+                        # 如果是RGB，转换为BGR
+                        if frame.shape[2] == 3:
+                            # 检查是否是RGB（通过检查第一个像素的通道顺序）
+                            # 简单判断：如果第一个像素的R值大于B值，可能是RGB
+                            # 但更安全的方法是假设从相机获取的是RGB
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if hasattr(cv2, 'COLOR_RGB2BGR') else frame
+                        else:
+                            frame_bgr = frame
+                    else:
+                        frame_bgr = frame
+                    
+                    # 保存为高质量JPEG（quality=95，保持高清）
+                    cv2.imwrite(str(snapshot_path), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    
+                    # 检查文件是否成功创建
+                    if not snapshot_path.exists():
+                        logger.warning(f"Failed to save monitoring snapshot: {snapshot_path}")
+                        continue
+                    
+                    file_size_mb = snapshot_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"Monitoring snapshot saved: {snapshot_path} ({file_size_mb:.2f}MB)")
+                    
+                    # 上传到云端
+                    snapshot_url = self.cloud_client.upload_monitoring_snapshot(
+                        image_path=str(snapshot_path),
+                        device_id=self.device_id
+                    )
+                    
+                    if snapshot_url:
+                        logger.info(f"Monitoring snapshot uploaded successfully: {snapshot_url}")
+                    else:
+                        logger.warning("Failed to upload monitoring snapshot")
+                    
+                    # 清理临时文件（可选，如果配置了保存则保留）
+                    if not self.config.save_snapshots:
+                        try:
+                            snapshot_path.unlink()
+                        except Exception as e:
+                            logger.debug(f"Failed to delete temp snapshot: {e}")
+                    
+                except Exception as e:
+                    logger.error(f"Error saving monitoring snapshot: {e}")
+                    # 清理临时文件
+                    try:
+                        if snapshot_path.exists():
+                            snapshot_path.unlink()
+                    except Exception:
+                        pass
+                
+            except Exception as e:
+                logger.error(f"Error in monitoring snapshot worker: {e}")
+                time.sleep(60)  # 出错时等待1分钟再重试
 

@@ -205,15 +205,6 @@ class ConfigLoader:
         """获取跟踪配置"""
         return self.config['tracking']
     
-    def get_data_retention(self) -> Dict[str, Any]:
-        """
-        获取数据留存配置
-        
-        Returns:
-            数据留存配置字典
-        """
-        return self.config.get('data_retention', {})
-    
     def get_paths(self) -> Dict[str, Any]:
         """获取路径配置"""
         return self.config['paths']

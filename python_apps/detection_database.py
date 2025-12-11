@@ -313,6 +313,73 @@ class DetectionDatabase:
             conn.close()
             
             return deleted_count
+    
+    def cleanup_excess_records(self, max_records: int) -> int:
+        """
+        清理超出最大记录数的旧记录（循环写入）
+        
+        Args:
+            max_records: 最大记录数
+            
+        Returns:
+            删除的记录数
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # 获取当前记录数
+            cursor.execute("SELECT COUNT(*) FROM detections")
+            current_count = cursor.fetchone()[0]
+            
+            if current_count <= max_records:
+                conn.close()
+                return 0
+            
+            # 计算需要删除的记录数
+            excess_count = current_count - max_records
+            
+            # 删除最旧的记录
+            cursor.execute("""
+                DELETE FROM detections 
+                WHERE id IN (
+                    SELECT id FROM detections 
+                    ORDER BY timestamp ASC 
+                    LIMIT ?
+                )
+            """, (excess_count,))
+            
+            deleted_count = cursor.rowcount
+            conn.commit()
+            conn.close()
+            
+            return deleted_count
+    
+    def get_record_count(self) -> int:
+        """
+        获取当前记录数
+        
+        Returns:
+            记录数
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM detections")
+            count = cursor.fetchone()[0]
+            conn.close()
+            return count
+    
+    def get_database_size_mb(self) -> float:
+        """
+        获取数据库文件大小（MB）
+        
+        Returns:
+            文件大小（MB）
+        """
+        if not os.path.exists(self.db_path):
+            return 0.0
+        return os.path.getsize(self.db_path) / (1024 * 1024)
 
 
 if __name__ == '__main__':

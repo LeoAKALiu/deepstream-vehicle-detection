@@ -84,3 +84,5 @@ Image compressed: XXX KB -> YYY KB (size: 1920x1080)
 
 系统已重启，所有优化已应用。前端现在应该能接收到更高分辨率的图像。
 
+
+

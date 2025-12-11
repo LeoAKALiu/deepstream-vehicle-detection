@@ -1,0 +1,12 @@
+excavator
+bulldozer
+roller
+loader
+dump-truck
+concrete-mixer
+pump-truck
+crane
+truck
+car
+
+
