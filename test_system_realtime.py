@@ -428,7 +428,35 @@ class MultiFrameValidator:
                     # 检查出现频率（在验证窗口内）
                     recent_frames = [fid for fid in frame_ids if self.frame_id - fid < self.validation_window]
                     if len(recent_frames) > 0:
-                        occurrence_ratio = len(recent_frames) / self.validation_window
+                        # 使用实际检查的帧数作为分母，而不是固定的validation_window
+                        # 这样可以正确处理系统刚启动时的情况（frame_id < validation_window）
+                        actual_window_size = min(self.frame_id, self.validation_window)
+                        occurrence_ratio = len(recent_frames) / actual_window_size
+                        # #region agent log
+                        try:
+                            import json
+                            with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({
+                                    'id': f'log_{int(time.time() * 1000)}',
+                                    'timestamp': int(time.time() * 1000),
+                                    'location': 'test_system_realtime.py:validate_detections',
+                                    'message': 'occurrence_ratio calculation',
+                                    'data': {
+                                        'detection_id': det_id,
+                                        'frame_id': self.frame_id,
+                                        'validation_window': self.validation_window,
+                                        'actual_window_size': actual_window_size,
+                                        'recent_frames_count': len(recent_frames),
+                                        'occurrence_ratio': occurrence_ratio,
+                                        'min_occurrence_ratio': self.min_occurrence_ratio,
+                                        'passed': occurrence_ratio >= self.min_occurrence_ratio,
+                                        'hypothesisId': 'F'
+                                    },
+                                    'sessionId': 'debug-session',
+                                    'runId': 'run1'
+                                }) + '\n')
+                        except: pass
+                        # #endregion
                         if occurrence_ratio >= self.min_occurrence_ratio:
                             valid_indices.append(i)
         
