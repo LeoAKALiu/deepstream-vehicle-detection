@@ -27,6 +27,7 @@ import threading
 from cassia_local_client import CassiaLocalClient
 from orbbec_depth import OrbbecDepthCamera
 from beacon_filter import BeaconFilter
+from beacon_match_tracker import BeaconMatchTracker
 from config_loader import get_config
 from byte_tracker import ByteTracker
 from hardware_recovery import HardwareRecovery
@@ -1163,9 +1164,29 @@ class RealtimeVehicleDetection:
         self.alerts = []  # 报警记录
         
         # 警报去重机制：记录最近处理的车辆位置，防止重复警报
-        self.recent_alerts = []  # [(track_id, bbox, timestamp), ...]
-        self.alert_dedup_time_window = 30.0  # 30秒内的重复警报会被忽略
-        self.alert_dedup_iou_threshold = 0.5  # IoU > 0.5认为是同一辆车
+        self.recent_alerts = []  # [(track_id, bbox, timestamp, class_name), ...]
+        # 从配置文件读取去重参数（Phase 1优化：移除硬编码）
+        alert_dedup_cfg = self.config.get('alert_dedup', {})
+        self.alert_dedup_time_window = alert_dedup_cfg.get('time_window', 30.0)
+        self.alert_dedup_iou_threshold = alert_dedup_cfg.get('iou_threshold', 0.5)
+        self.alert_dedup_position_time_window = alert_dedup_cfg.get('position_time_window', 10.0)
+        
+        # 跟踪最小置信度阈值（Phase 1优化：移除硬编码0.7）
+        self.min_track_confidence = tracking_cfg.get('min_track_confidence', 0.7)
+        print(f"  跟踪最小置信度阈值: {self.min_track_confidence}")
+        
+        # 信标匹配时空一致性跟踪器（Phase 1优化）
+        beacon_match_cfg = self.config.get('beacon_match', {}).get('temporal_consistency', {})
+        if beacon_match_cfg.get('enabled', True):
+            self.beacon_match_tracker = BeaconMatchTracker(
+                min_consistent_frames=beacon_match_cfg.get('min_consistent_frames', 5),
+                max_distance_error=beacon_match_cfg.get('max_distance_error', 1.0),
+                reset_on_track_end=beacon_match_cfg.get('reset_on_track_end', True)
+            )
+            print(f"  信标匹配时空一致性: 启用 (最小连续帧={beacon_match_cfg.get('min_consistent_frames', 5)}, 距离误差阈值={beacon_match_cfg.get('max_distance_error', 1.0)}m)")
+        else:
+            self.beacon_match_tracker = None
+            print(f"  信标匹配时空一致性: 禁用")
         
         # 检测结果数据库（可选）
         self.detection_db = None
@@ -1678,8 +1699,8 @@ class RealtimeVehicleDetection:
             iou = self._compute_bbox_iou(bbox, existing_bbox)
             time_diff = current_time - existing_time
             
-            if iou > self.alert_dedup_iou_threshold and time_diff < 10.0:
-                # 位置重叠且时间接近（10秒内），可能是跟踪ID切换导致的重复
+            if iou > self.alert_dedup_iou_threshold and time_diff < self.alert_dedup_position_time_window:
+                # 位置重叠且时间接近（Phase 1优化：使用配置值），可能是跟踪ID切换导致的重复
                 print(f"  ⚠ 检测到重复警报：Track#{track_id} ({class_name}) 与 Track#{existing_track_id} ({existing_class}) 位置重叠（IoU={iou:.2f}，时间差={time_diff:.1f}s）")
                 return True
         
@@ -2388,6 +2409,11 @@ class RealtimeVehicleDetection:
                 # 更新self.tracks供stats回调使用
                 self.tracks = tracks
                 
+                # Phase 1优化：清理已结束track的匹配历史
+                if self.beacon_match_tracker:
+                    active_track_ids = set(tracks.keys())
+                    self.beacon_match_tracker.cleanup(active_track_ids)
+                
                 # 处理新车辆（支持多目标匹配）
                 new_construction_vehicles = []  # 收集新的工程车辆
                 new_civilian_vehicles = []  # 收集新的社会车辆
@@ -2473,9 +2499,9 @@ class RealtimeVehicleDetection:
                         # 获取检测置信度
                         detection_confidence = track.get('confidence', track.get('score', 0.0))
                         
-                        # 增加置信度阈值检查（减少误识别）
-                        if detection_confidence < 0.7:  # 提高阈值，减少低置信度的误识别
-                            print(f"  ⚠ 置信度过低({detection_confidence:.2f})，跳过: Track#{track_id} ({class_name})")
+                        # 增加置信度阈值检查（减少误识别）（Phase 1优化：使用配置值）
+                        if detection_confidence < self.min_track_confidence:
+                            print(f"  ⚠ 置信度过低({detection_confidence:.2f} < {self.min_track_confidence})，跳过: Track#{track_id} ({class_name})")
                             # 标记为已处理，避免重复
                             if hasattr(self.tracker, 'mark_processed'):
                                 self.tracker.mark_processed(track_id)
@@ -2729,6 +2755,27 @@ class RealtimeVehicleDetection:
                                     continue
                                 
                                 match_result = match_results[i] if i < len(match_results) else None
+                                
+                                # Phase 1优化：使用信标匹配时空一致性跟踪器
+                                locked_beacon_mac = None
+                                if self.beacon_match_tracker:
+                                    beacon_mac = match_result['beacon_info']['mac'] if (match_result and match_result.get('matched') and match_result.get('beacon_info')) else None
+                                    distance = vehicles_info[i].get('camera_depth')
+                                    match_cost = match_result.get('cost') if match_result else None
+                                    
+                                    # 更新匹配跟踪器
+                                    locked_beacon_mac = self.beacon_match_tracker.update_match(
+                                        vehicle['track_id'],
+                                        beacon_mac,
+                                        distance,
+                                        match_cost
+                                    )
+                                    
+                                    # 如果尚未锁定，跳过本次处理（等待连续匹配）
+                                    if locked_beacon_mac is None and beacon_mac is not None:
+                                        print(f"  ⏳ [信标匹配] Track#{vehicle['track_id']} 匹配中... 等待连续{self.beacon_match_tracker.min_consistent_frames}帧确认")
+                                        continue
+                                
                                 # #region agent log
                                 try:
                                     import json
