@@ -26,8 +26,6 @@ import threading
 # 导入自定义模块
 from cassia_local_client import CassiaLocalClient
 from orbbec_depth import OrbbecDepthCamera
-from depth_smoothing import create_depth_smoother
-from best_frame_lpr import BestFrameLPR, TrackInfo
 from beacon_filter import BeaconFilter
 from beacon_match_tracker import BeaconMatchTracker
 from config_loader import get_config
@@ -1020,18 +1018,16 @@ class RealtimeVehicleDetection:
         print("\n【2. 初始化跟踪器】")
         tracker_type = tracking_cfg.get('tracker_type', 'simple_iou')
         if tracker_type == 'bytetrack':
-            # Phase 2优化: 使用优化后的默认值
             self.tracker = ByteTracker(
                 track_thresh=tracking_cfg.get('track_thresh', 0.5),
                 high_thresh=tracking_cfg.get('high_thresh', 0.6),
-                match_thresh=tracking_cfg.get('match_thresh', 0.4),  # Phase 2: 降低到0.4以提高跟踪稳定性
-                track_buffer=tracking_cfg.get('track_buffer', 200)   # Phase 2: 增大到200以防止ID丢失
+                match_thresh=tracking_cfg.get('match_thresh', 0.8),
+                track_buffer=tracking_cfg.get('track_buffer', 30)
             )
-            print(f"✓ ByteTrack跟踪器初始化完成 (Phase 2优化)")
+            print(f"✓ ByteTrack跟踪器初始化完成")
             print(f"  跟踪阈值: {tracking_cfg.get('track_thresh', 0.5)}")
             print(f"  高置信度阈值: {tracking_cfg.get('high_thresh', 0.6)}")
-            print(f"  匹配阈值: {tracking_cfg.get('match_thresh', 0.4)} (Phase 2优化)")
-            print(f"  跟踪缓冲区: {tracking_cfg.get('track_buffer', 200)} (Phase 2优化)")
+            print(f"  匹配阈值: {tracking_cfg.get('match_thresh', 0.8)}")
         else:
             self.tracker = VehicleTracker(
                 iou_threshold=tracking_cfg['iou_threshold'],
@@ -1148,23 +1144,9 @@ class RealtimeVehicleDetection:
                 max_queue_size=10
             )
             print("✓ 异步LPR处理器初始化成功")
-            
-            # Phase 2优化: 初始化最佳帧选择器
-            lpr_cfg = self.config.get('lpr', {}).get('best_frame_selection', {})
-            if lpr_cfg.get('enabled', True):
-                self.best_frame_lpr = BestFrameLPR(
-                    quality_threshold=lpr_cfg.get('quality_threshold', 0.6),
-                    max_wait_frames=lpr_cfg.get('max_wait_frames', 30),
-                    reuse_result=lpr_cfg.get('reuse_result', True)
-                )
-                print(f"✓ LPR最佳帧选择器初始化成功 (质量阈值={lpr_cfg.get('quality_threshold', 0.6)}, 最大等待帧数={lpr_cfg.get('max_wait_frames', 30)})")
-            else:
-                self.best_frame_lpr = None
-                print("ℹ LPR最佳帧选择器: 禁用")
         else:
             self.lpr_detector = None
             self.async_lpr = None
-            self.best_frame_lpr = None
         
         # 加载中文字体
         display_cfg = self.config.get_display()
@@ -1887,15 +1869,7 @@ class RealtimeVehicleDetection:
                 if distance:
                     depth_confidence = 1.0  # 单点测量，假设置信度为1.0
             
-            # Phase 2优化: 应用时间平滑
-            if distance is not None and self.depth_smoother:
-                smoothed_distance = self.depth_smoother.update(track_id, distance)
-                if smoothed_distance is not None:
-                    distance = smoothed_distance
-                    print(f"  📏 相机深度: {distance:.2f} m (平滑后, 置信度: {depth_confidence:.1%})")
-                else:
-                    print(f"  📏 相机深度: {distance:.2f} m (原始, 置信度: {depth_confidence:.1%})")
-            elif distance:
+            if distance:
                 print(f"  📏 相机深度: {distance:.2f} m (置信度: {depth_confidence:.1%})")
                 if depth_confidence < 0.3:
                     print(f"  ⚠ 深度置信度较低，可能影响信标匹配准确性")
@@ -2021,14 +1995,6 @@ class RealtimeVehicleDetection:
         plate_number = None
         confidence = 0.0
         
-        # Phase 2优化: 检查是否已有识别结果（结果复用）
-        if self.best_frame_lpr:
-            existing_result = self.best_frame_lpr.get_result(track_id)
-            if existing_result:
-                plate_number, confidence = existing_result
-                print(f"  ✓ 车牌号（复用）: {plate_number} (置信度: {confidence:.2f})")
-                return {'track_id': track_id, 'plate_number': plate_number, 'confidence': confidence}
-        
         if self.async_lpr:
             # 裁剪车辆区域
             vehicle_roi = image[int(y1):int(y2), int(x1):int(x2)]
@@ -2037,43 +2003,8 @@ class RealtimeVehicleDetection:
                 # 转换为BGR
                 vehicle_roi_bgr = cv2.cvtColor(vehicle_roi, cv2.COLOR_RGB2BGR)
                 
-                # Phase 2优化: 使用最佳帧选择器
-                if self.best_frame_lpr:
-                    # 获取距离信息（如果有深度相机）
-                    distance = None
-                    detection_confidence = 0.0
-                    if self.depth_camera:
-                        distance, _ = self.depth_camera.get_depth_at_bbox_bottom_robust(bbox, window_size=5, outlier_threshold=2.0)
-                    
-                    # 检查是否应该触发识别
-                    should_trigger, best_roi = self.best_frame_lpr.should_trigger_lpr(
-                        track_id=track_id,
-                        bbox=bbox,
-                        roi_bgr=vehicle_roi_bgr,
-                        confidence=detection_confidence,
-                        frame_shape=image.shape,
-                        distance=distance
-                    )
-                    
-                    if should_trigger and best_roi is not None:
-                        # 使用最佳帧进行识别
-                        submitted = self.async_lpr.submit_recognition(track_id, best_roi, class_name or 'car')
-                        if submitted:
-                            print(f"  📤 已提交车牌识别任务（最佳帧，异步）")
-                        else:
-                            # 检查是否有已完成的结果
-                            plate_number, confidence = self.async_lpr.get_result(track_id)
-                            if plate_number:
-                                print(f"  ✓ 车牌号: {plate_number} (置信度: {confidence:.2f})")
-                                self.best_frame_lpr.on_lpr_complete(track_id, plate_number, confidence)
-                            else:
-                                print(f"  ⚠ 未提交识别任务（可能因频率限制或ROI质量不足）")
-                    else:
-                        # 等待最佳帧
-                        print(f"  ⏳ 等待最佳帧出现... (当前帧数: {self.best_frame_lpr.track_queue.get(track_id, TrackInfo()).frame_count if track_id in self.best_frame_lpr.track_queue else 0})")
-                else:
-                    # 原有逻辑（不使用最佳帧选择器）
-                    submitted = self.async_lpr.submit_recognition(track_id, vehicle_roi_bgr, class_name or 'car')
+                # 提交异步识别任务
+                submitted = self.async_lpr.submit_recognition(track_id, vehicle_roi_bgr, class_name or 'car')
                 
                 if submitted:
                     print(f"  📤 已提交车牌识别任务（异步）")
@@ -2479,20 +2410,9 @@ class RealtimeVehicleDetection:
                 self.tracks = tracks
                 
                 # Phase 1优化：清理已结束track的匹配历史
-                # Phase 2优化：清理已结束track的深度平滑历史
-                    # Phase 1 & 2优化：清理已结束track的状态
-                    if self.beacon_match_tracker or self.depth_smoother or self.best_frame_lpr:
-                        active_track_ids = set(tracks.keys())
-                        if self.beacon_match_tracker:
-                            self.beacon_match_tracker.cleanup(active_track_ids)
-                        if self.depth_smoother:
-                            # 清理深度平滑器中已结束的track
-                            expired_tracks = set(self.depth_smoother.track_depths.keys()) - active_track_ids
-                            for track_id in expired_tracks:
-                                self.depth_smoother.reset(track_id)
-                        if self.best_frame_lpr:
-                            # 清理最佳帧选择器中已结束的track
-                            self.best_frame_lpr.cleanup(active_track_ids)
+                if self.beacon_match_tracker:
+                    active_track_ids = set(tracks.keys())
+                    self.beacon_match_tracker.cleanup(active_track_ids)
                 
                 # 处理新车辆（支持多目标匹配）
                 new_construction_vehicles = []  # 收集新的工程车辆
@@ -2733,9 +2653,6 @@ class RealtimeVehicleDetection:
                         if alert and alert.get('type') == 'civilian' and alert.get('status') == 'identifying':
                             plate_number, confidence = self.async_lpr.get_result(track_id)
                             if plate_number:
-                                # Phase 2优化: 更新最佳帧选择器状态
-                                if self.best_frame_lpr:
-                                    self.best_frame_lpr.on_lpr_complete(track_id, plate_number, confidence)
                                 # 更新alert
                                 alert['status'] = 'identified'
                                 alert['plate'] = plate_number

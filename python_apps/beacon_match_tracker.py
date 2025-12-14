@@ -149,10 +149,14 @@ class BeaconMatchTracker:
             else:
                 # 匹配不一致，如果差异太大，可能需要重置
                 # 这里先保持锁定，实际应用中可能需要更复杂的逻辑
-                pass
+                # 返回已锁定的信标，即使当前帧匹配不一致
+                return history.locked_beacon_mac
         
         # 如果当前帧匹配失败，不记录
         if beacon_mac is None:
+            # 如果已锁定，即使当前帧匹配失败，也返回锁定信标
+            if history.is_locked():
+                return history.locked_beacon_mac
             return None
         
         # 添加匹配记录
