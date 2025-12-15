@@ -86,16 +86,9 @@ class TrackDepthSmoother:
             return initial
         
         # EMA: smoothed = alpha * new + (1-alpha) * previous
-        # 如果track_id不在track_smoothed中，使用前N个值的中位数作为初始平滑值
-        if track_id not in self.track_smoothed:
-            # 使用前min_samples个值的中位数作为初始平滑值
-            initial_smoothed = np.median(history[:self.min_samples])
-            self.track_smoothed[track_id] = initial_smoothed
-            previous_smoothed = initial_smoothed
-        else:
-            previous_smoothed = self.track_smoothed[track_id]
-        
+        previous_smoothed = self.track_smoothed.get(track_id, history[-2])
         current_value = history[-1]
+        
         smoothed = self.alpha * current_value + (1 - self.alpha) * previous_smoothed
         return smoothed
     

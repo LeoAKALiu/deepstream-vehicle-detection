@@ -1,0 +1,28 @@
+Phase 2 部署信息
+================
+部署时间: 2025年 12月 14日 星期日 22:16:44 CST
+备份目录: /home/liubo/Download/deepstream-vehicle-detection/backups/phase2_20251214_221644
+
+部署内容（已测试的3项）:
+1. ByteTrack参数调优 (match_thresh=0.4, track_buffer=200)
+2. 深度测量时间平滑 (EMA方法, alpha=0.7)
+3. LPR最佳帧选取 (质量阈值=0.6, 最大等待帧数=30)
+
+修改的文件:
+- config.yaml (新增配置项)
+- test_system_realtime.py (集成新功能)
+- python_apps/depth_smoothing.py (新文件)
+- python_apps/best_frame_lpr.py (新文件)
+
+回滚方法:
+1. 恢复备份文件:
+   cp /home/liubo/Download/deepstream-vehicle-detection/backups/phase2_20251214_221644/config.yaml.backup /home/liubo/Download/deepstream-vehicle-detection/config.yaml
+   cp /home/liubo/Download/deepstream-vehicle-detection/backups/phase2_20251214_221644/test_system_realtime.py.backup /home/liubo/Download/deepstream-vehicle-detection/test_system_realtime.py
+
+2. 如果不再需要，删除新文件:
+   rm /home/liubo/Download/deepstream-vehicle-detection/python_apps/depth_smoothing.py
+   rm /home/liubo/Download/deepstream-vehicle-detection/python_apps/best_frame_lpr.py
+
+3. 重启系统
+
+测试日志: /tmp/phase2_test.log

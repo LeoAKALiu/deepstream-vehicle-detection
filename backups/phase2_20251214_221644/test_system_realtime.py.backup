@@ -28,7 +28,6 @@ from cassia_local_client import CassiaLocalClient
 from orbbec_depth import OrbbecDepthCamera
 from depth_smoothing import create_depth_smoother
 from best_frame_lpr import BestFrameLPR, TrackInfo
-from loitering_detector import LoiteringDetector
 from beacon_filter import BeaconFilter
 from beacon_match_tracker import BeaconMatchTracker
 from config_loader import get_config
@@ -1167,22 +1166,6 @@ class RealtimeVehicleDetection:
             self.async_lpr = None
             self.best_frame_lpr = None
         
-        # Phase 2优化: 初始化徘徊检测器
-        alert_cfg = self.config.get('alert', {}).get('loitering', {})
-        if alert_cfg.get('enabled', True):
-            self.loitering_detector = LoiteringDetector(
-                min_duration=alert_cfg.get('min_duration', 10.0),
-                min_area_ratio=alert_cfg.get('min_area_ratio', 0.05),
-                min_movement_ratio=alert_cfg.get('min_movement_ratio', 0.1)
-            )
-            apply_to_unregistered_only = alert_cfg.get('apply_to_unregistered_only', True)
-            self.loitering_apply_to_unregistered_only = apply_to_unregistered_only
-            print(f"✓ 徘徊检测器初始化成功 (最少停留时间={alert_cfg.get('min_duration', 10.0)}s, 最小画面占比={alert_cfg.get('min_area_ratio', 0.05)}, 只对未备案车辆应用={apply_to_unregistered_only})")
-        else:
-            self.loitering_detector = None
-            self.loitering_apply_to_unregistered_only = False
-            print("ℹ 徘徊检测器: 禁用")
-        
         # 加载中文字体
         display_cfg = self.config.get_display()
         try:
@@ -1264,17 +1247,6 @@ class RealtimeVehicleDetection:
         
         # 深度测量配置
         self.depth_config = depth_cfg
-        
-        # Phase 2优化: 深度测量时间平滑
-        if use_depth and self.depth_camera:
-            self.depth_smoother = create_depth_smoother(depth_cfg)
-            if self.depth_smoother:
-                print(f"  ✓ 深度测量时间平滑: 启用 (方法={depth_cfg.get('smoothing', {}).get('method', 'ema')}, alpha={depth_cfg.get('smoothing', {}).get('alpha', 0.7)})")
-            else:
-                print(f"  ℹ 深度测量时间平滑: 禁用")
-                self.depth_smoother = None
-        else:
-            self.depth_smoother = None
         
         # 多帧验证器（减少假阳性）
         multi_frame_cfg = detection_cfg.get('multi_frame_validation', {})
@@ -1967,13 +1939,7 @@ class RealtimeVehicleDetection:
         elif not self.beacon_filter:
             print(f"  ✗ 信标过滤器未初始化")
         
-        # Phase 2优化: 更新徘徊检测器（为所有车辆更新，用于后续判定）
-        if self.loitering_detector:
-            import time
-            current_time = time.time()
-            self.loitering_detector.update(track_id, bbox, image.shape, current_time)
-        
-        # 判断备案状态
+        # 判断
         if beacon_info:
             # 验证车辆类型是否匹配
             beacon_vehicle_type = beacon_info.get('vehicle_type', 'unknown')
@@ -2012,20 +1978,7 @@ class RealtimeVehicleDetection:
                 if beacon_info.get('plate_number'):
                     print(f"     车牌: {beacon_info['plate_number']}")
             else:
-                # 类型不匹配，视为未备案 - Phase 2优化: 应用徘徊判定
-                should_alert = True
-                
-                if self.loitering_detector and self.loitering_apply_to_unregistered_only:
-                    import time
-                    is_loitering = self.loitering_detector.is_loitering(track_id, time.time())
-                    should_alert = is_loitering
-                    
-                    if not is_loitering:
-                        duration = self.loitering_detector.get_duration(track_id, time.time())
-                        print(f"\n  ⏳ 未备案车辆，但未满足徘徊条件（停留时间: {duration:.1f}s < {self.loitering_detector.min_duration}s），暂不报警")
-                        print(f"{'='*70}\n")
-                        return None  # 不创建alert
-                
+                # 类型不匹配，视为未备案
                 alert = {
                     'track_id': track_id,
                     'type': 'construction_vehicle',  # 修正：工程车辆类型
@@ -2040,20 +1993,6 @@ class RealtimeVehicleDetection:
                 }
                 print(f"\n  🚨 结果: 未备案工程车辆！（检测为{detected_class}，信标绑定为{beacon_vehicle_type}）")
         else:
-            # 无信标匹配，视为未备案 - Phase 2优化: 应用徘徊判定
-            should_alert = True
-            
-            if self.loitering_detector and self.loitering_apply_to_unregistered_only:
-                import time
-                is_loitering = self.loitering_detector.is_loitering(track_id, time.time())
-                should_alert = is_loitering
-                
-                if not is_loitering:
-                    duration = self.loitering_detector.get_duration(track_id, time.time())
-                    print(f"\n  ⏳ 未备案车辆，但未满足徘徊条件（停留时间: {duration:.1f}s < {self.loitering_detector.min_duration}s），暂不报警")
-                    print(f"{'='*70}\n")
-                    return None  # 不创建alert
-            
             alert = {
                 'track_id': track_id,
                 'type': 'construction_vehicle',  # 修正：工程车辆类型
@@ -2064,7 +2003,7 @@ class RealtimeVehicleDetection:
                 'confidence': detection_confidence,  # 使用检测置信度
                 'color': COLORS['unregistered']
             }
-            print(f"\n  🚨 结果: 未备案工程车辆！（无信标匹配）")
+            print(f"\n  🚨 结果: 未备案工程车辆！")
         
         print(f"{'='*70}\n")
         return alert
@@ -2132,7 +2071,6 @@ class RealtimeVehicleDetection:
                     else:
                         # 等待最佳帧
                         print(f"  ⏳ 等待最佳帧出现... (当前帧数: {self.best_frame_lpr.track_queue.get(track_id, TrackInfo()).frame_count if track_id in self.best_frame_lpr.track_queue else 0})")
-                        submitted = False  # 未触发识别
                 else:
                     # 原有逻辑（不使用最佳帧选择器）
                     submitted = self.async_lpr.submit_recognition(track_id, vehicle_roi_bgr, class_name or 'car')
@@ -2540,22 +2478,21 @@ class RealtimeVehicleDetection:
                 # 更新self.tracks供stats回调使用
                 self.tracks = tracks
                 
-                # Phase 1 & 2优化：清理已结束track的状态
-                if self.beacon_match_tracker or self.depth_smoother or self.best_frame_lpr or self.loitering_detector:
-                    active_track_ids = set(tracks.keys())
-                    if self.beacon_match_tracker:
-                        self.beacon_match_tracker.cleanup(active_track_ids)
-                    if self.depth_smoother:
-                        # 清理深度平滑器中已结束的track
-                        expired_tracks = set(self.depth_smoother.track_depths.keys()) - active_track_ids
-                        for track_id in expired_tracks:
-                            self.depth_smoother.reset(track_id)
-                    if self.best_frame_lpr:
-                        # 清理最佳帧选择器中已结束的track
-                        self.best_frame_lpr.cleanup(active_track_ids)
-                    if self.loitering_detector:
-                        # 清理徘徊检测器中已结束的track
-                        self.loitering_detector.cleanup(active_track_ids)
+                # Phase 1优化：清理已结束track的匹配历史
+                # Phase 2优化：清理已结束track的深度平滑历史
+                    # Phase 1 & 2优化：清理已结束track的状态
+                    if self.beacon_match_tracker or self.depth_smoother or self.best_frame_lpr:
+                        active_track_ids = set(tracks.keys())
+                        if self.beacon_match_tracker:
+                            self.beacon_match_tracker.cleanup(active_track_ids)
+                        if self.depth_smoother:
+                            # 清理深度平滑器中已结束的track
+                            expired_tracks = set(self.depth_smoother.track_depths.keys()) - active_track_ids
+                            for track_id in expired_tracks:
+                                self.depth_smoother.reset(track_id)
+                        if self.best_frame_lpr:
+                            # 清理最佳帧选择器中已结束的track
+                            self.best_frame_lpr.cleanup(active_track_ids)
                 
                 # 处理新车辆（支持多目标匹配）
                 new_construction_vehicles = []  # 收集新的工程车辆
