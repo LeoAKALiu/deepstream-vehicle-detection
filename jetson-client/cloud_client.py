@@ -293,30 +293,7 @@ class CloudClient:
                     json=alert_data,
                     timeout=10
                 )
-            except Exception as post_error:
-                # #region agent log
-                try:
-                    import json as json_log
-                    with open('/home/liubo/Download/deepstream-vehicle-detection/.cursor/debug.log', 'a') as f:
-                        f.write(json_log.dumps({
-                            'id': f'log_{int(time.time() * 1000)}',
-                            'timestamp': int(time.time() * 1000),
-                            'location': 'cloud_client.py:send_alert',
-                            'message': 'POST request exception',
-                            'data': {
-                                'track_id': track_id,
-                                'attempt': attempt + 1,
-                                'error': str(post_error),
-                                'error_type': type(post_error).__name__,
-                                'hypothesisId': 'E'
-                            },
-                            'sessionId': 'debug-session',
-                            'runId': 'run1'
-                        }) + '\n')
-                except: pass
-                # #endregion
-                raise
-            
+                
                 # #region agent log
                 try:
                     import json as json_log
