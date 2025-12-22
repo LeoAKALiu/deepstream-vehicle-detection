@@ -19,13 +19,16 @@ except ImportError:
 class OrbbecDepthCamera:
     """Orbbec深度相机管理类"""
     
-    def __init__(self, invalid_min=0, invalid_max=65535):
+    def __init__(self, invalid_min=0, invalid_max=65535, prefer_uncompressed_format=True):
         """
         初始化Orbbec相机
         
         Args:
             invalid_min: 无效深度最小值（毫米，通常为0）
             invalid_max: 无效深度最大值（毫米，通常为65535）
+            prefer_uncompressed_format: 是否优先选择未压缩格式（RGB/BGR而非MJPEG）
+                                       True: 优先RGB/BGR（图像质量更好，适合LPR识别）
+                                       False: 只考虑分辨率（可能选择MJPEG压缩格式）
         """
         if not ORBBEC_AVAILABLE:
             raise ImportError("pyorbbecsdk未安装")
@@ -40,14 +43,16 @@ class OrbbecDepthCamera:
         self.invalid_min = invalid_min
         self.invalid_max = invalid_max
         self.align_mode = None  # 记录对齐模式
+        self.prefer_uncompressed_format = prefer_uncompressed_format  # 格式偏好
         
-    def _select_highest_resolution_profile(self, profile_list, sensor_type_name="流"):
+    def _select_highest_resolution_profile(self, profile_list, sensor_type_name="流", prefer_uncompressed=True):
         """
         从流配置列表中选择最高分辨率的配置
         
         Args:
             profile_list: 流配置列表
             sensor_type_name: 传感器类型名称（用于日志）
+            prefer_uncompressed: 是否优先选择未压缩格式（RGB/BGR而非MJPEG）
         
         Returns:
             最高分辨率的VideoStreamProfile，如果失败返回None
@@ -58,11 +63,13 @@ class OrbbecDepthCamera:
         best_profile = None
         best_resolution = 0  # width * height
         best_fps = 0
+        best_format_score = 0  # 格式优先级分数（未压缩格式更高）
         
         print(f"  📋 可用{sensor_type_name}配置:")
         for i in range(profile_list.get_count()):
             try:
-                profile = profile_list.get_profile(i)
+                # 使用get_stream_profile_by_index（正确的API方法名）
+                profile = profile_list.get_stream_profile_by_index(i)
                 if not profile.is_video_stream_profile():
                     continue
                 
@@ -71,21 +78,61 @@ class OrbbecDepthCamera:
                 height = video_profile.get_height()
                 fps = video_profile.get_fps()
                 resolution = width * height
+                format_type = video_profile.get_format()
                 
-                print(f"    [{i}] {width}x{height} @ {fps}fps (分辨率: {resolution} 像素)")
+                # 格式优先级分数：RGB/BGR > 其他未压缩 > MJPEG
+                format_score = 0
+                format_name = "未知"
+                if format_type == ob.OBFormat.RGB:
+                    format_score = 3
+                    format_name = "RGB(未压缩)"
+                elif format_type == ob.OBFormat.BGR:
+                    format_score = 3
+                    format_name = "BGR(未压缩)"
+                elif format_type == ob.OBFormat.MJPG:
+                    format_score = 1
+                    format_name = "MJPEG(压缩)"
+                else:
+                    format_score = 2  # 其他格式，中等优先级
+                    format_name = f"格式{format_type}"
                 
-                # 选择最高分辨率，如果分辨率相同则选择更高帧率
-                if resolution > best_resolution or (resolution == best_resolution and fps > best_fps):
+                print(f"    [{i}] {width}x{height} @ {fps}fps | {format_name} | 分辨率: {resolution} 像素")
+                
+                # 选择策略：
+                # 1. 如果prefer_uncompressed=True，优先选择未压缩格式
+                # 2. 格式相同时，选择最高分辨率
+                # 3. 格式和分辨率都相同时，选择更高帧率
+                should_select = False
+                if prefer_uncompressed:
+                    # 优先格式分数，然后分辨率，最后帧率
+                    if format_score > best_format_score:
+                        should_select = True
+                    elif format_score == best_format_score:
+                        if resolution > best_resolution:
+                            should_select = True
+                        elif resolution == best_resolution and fps > best_fps:
+                            should_select = True
+                else:
+                    # 只考虑分辨率和帧率
+                    if resolution > best_resolution or (resolution == best_resolution and fps > best_fps):
+                        should_select = True
+                
+                if should_select:
                     best_profile = profile
                     best_resolution = resolution
                     best_fps = fps
+                    best_format_score = format_score
             except Exception as e:
                 print(f"    ⚠ 无法读取配置 [{i}]: {e}")
                 continue
         
         if best_profile:
             video_profile = best_profile.as_video_stream_profile()
-            print(f"  ✅ 选择最高分辨率: {video_profile.get_width()}x{video_profile.get_height()} @ {video_profile.get_fps()}fps")
+            format_type = video_profile.get_format()
+            format_name = "RGB" if format_type == ob.OBFormat.RGB else \
+                         "BGR" if format_type == ob.OBFormat.BGR else \
+                         "MJPEG" if format_type == ob.OBFormat.MJPG else f"格式{format_type}"
+            print(f"  ✅ 选择配置: {video_profile.get_width()}x{video_profile.get_height()} @ {video_profile.get_fps()}fps | {format_name}")
         
         return best_profile
     
@@ -112,14 +159,23 @@ class OrbbecDepthCamera:
                     config.enable_stream(depth_profile)
                     print(f"✓ 深度流（默认）: {depth_profile.get_width()}x{depth_profile.get_height()} @{depth_profile.get_fps()}fps")
             
-            # 启用彩色流（选择最高分辨率，用于对齐）
+            # 启用彩色流（优先选择未压缩格式RGB/BGR而非MJPEG，用于获得更高图像质量）
             color_profile_list = self.pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
             if color_profile_list:
-                color_profile = self._select_highest_resolution_profile(color_profile_list, "彩色流")
+                # 使用配置的格式偏好（优先RGB/BGR未压缩格式，图像质量更好）
+                color_profile = self._select_highest_resolution_profile(
+                    color_profile_list, 
+                    "彩色流",
+                    prefer_uncompressed=self.prefer_uncompressed_format
+                )
                 if color_profile:
                     config.enable_stream(color_profile)
                     video_profile = color_profile.as_video_stream_profile()
-                    print(f"✓ 彩色流已启用: {video_profile.get_width()}x{video_profile.get_height()} @{video_profile.get_fps()}fps")
+                    format_type = video_profile.get_format()
+                    format_name = "RGB(未压缩)" if format_type == ob.OBFormat.RGB else \
+                                 "BGR(未压缩)" if format_type == ob.OBFormat.BGR else \
+                                 "MJPEG(压缩)" if format_type == ob.OBFormat.MJPG else f"格式{format_type}"
+                    print(f"✓ 彩色流已启用: {video_profile.get_width()}x{video_profile.get_height()} @{video_profile.get_fps()}fps | {format_name}")
                 else:
                     # 回退到默认配置
                     color_profile = color_profile_list.get_default_video_stream_profile()
@@ -174,7 +230,12 @@ class OrbbecDepthCamera:
                             config.enable_stream(depth_profile)
                     color_profile_list = self.pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
                     if color_profile_list:
-                        color_profile = self._select_highest_resolution_profile(color_profile_list, "彩色流")
+                        # 回退模式也使用配置的格式偏好
+                        color_profile = self._select_highest_resolution_profile(
+                            color_profile_list, 
+                            "彩色流",
+                            prefer_uncompressed=self.prefer_uncompressed_format
+                        )
                         if color_profile:
                             config.enable_stream(color_profile)
                         else:
@@ -432,14 +493,11 @@ class OrbbecDepthCamera:
                 valid_depths = region[(region > self.invalid_min) & (region < self.invalid_max)]
                 
                 if len(valid_depths) == 0:
-                    return None
+                    return None, 0.0
                 
                 # 计算有效像素比例（用于置信度）
                 total_pixels = region.size
                 valid_pixel_ratio = len(valid_depths) / total_pixels if total_pixels > 0 else 0.0
-                
-                if len(valid_depths) == 0:
-                    return None, 0.0  # 返回深度和置信度
                 
                 # 计算统计值
                 if method == 'mean':

@@ -92,6 +92,9 @@ depth:
     alpha: 0.7                    # EMA系数 (0-1)，值越大对新值权重越高
     window_size: 5                # 滑动窗口大小（用于median方法）
     min_samples: 3                # 最小样本数，达到此数量后才开始平滑
+  # 图像质量优化: 优先使用未压缩格式（RGB/BGR）而非MJPEG压缩格式
+  # 这样可以获得更清晰的图像，提高LPR识别准确率
+  prefer_uncompressed_format: true  # 是否优先选择未压缩格式（RGB/BGR）
 
 # ============================================
 # 车牌识别(LPR)配置

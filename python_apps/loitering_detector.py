@@ -52,6 +52,17 @@ class LoiteringDetector:
         self.track_enter_time: Dict[int, float] = {}  # {track_id: enter_timestamp}
         self.track_positions: Dict[int, list] = defaultdict(list)  # {track_id: [TrackPosition, ...]}
         
+        # 记录已报警的track（避免重复报警）
+        self.alerted_tracks: Dict[int, float] = {}  # {track_id: alert_timestamp}
+        
+        # 记录已报警的位置区域（避免track_id变化时重复报警）
+        # 格式: [(bbox_center_x, bbox_center_y, bbox_width, bbox_height, alert_timestamp), ...]
+        self.alerted_positions: list = []
+        
+        # 位置去重参数
+        self.position_dedup_iou_threshold = 0.5  # 位置重叠IoU阈值
+        self.position_dedup_time_window = 3600.0  # 位置去重时间窗口（秒），默认1小时
+        
         # 最大保留位置数量（防止内存无限增长）
         self.max_positions = 100
     
@@ -100,20 +111,55 @@ class LoiteringDetector:
         if len(self.track_positions[track_id]) > self.max_positions:
             self.track_positions[track_id].pop(0)
     
+    def _compute_bbox_iou(self, box1: Tuple[float, float, float, float], box2: Tuple[float, float, float, float]) -> float:
+        """
+        计算两个bbox的IoU
+        
+        Args:
+            box1: [x1, y1, x2, y2]
+            box2: [x1, y1, x2, y2]
+        
+        Returns:
+            float: IoU值 (0-1)
+        """
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        # 计算交集区域
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
     def is_loitering(
         self,
         track_id: int,
+        bbox: Optional[Tuple[float, float, float, float]] = None,
         current_time: Optional[float] = None
     ) -> bool:
         """
-        判断是否满足徘徊条件
+        判断是否满足徘徊条件（并检查位置是否已报警）
         
         Args:
             track_id: 跟踪ID
+            bbox: 边界框 [x1, y1, x2, y2]，用于位置去重检查
             current_time: 当前时间戳（秒），如果为None则使用time.time()
         
         Returns:
-            bool: 如果满足徘徊条件返回True，否则返回False
+            bool: 如果满足徘徊条件且位置未报警返回True，否则返回False
         """
         if current_time is None:
             current_time = time.time()
@@ -121,6 +167,24 @@ class LoiteringDetector:
         # 检查是否是新track
         if track_id not in self.track_enter_time:
             return False
+        
+        # 如果已经报警过（基于track_id），不再重复报警
+        if track_id in self.alerted_tracks:
+            return False
+        
+        # 清理过期的位置记录
+        self.alerted_positions = [
+            pos for pos in self.alerted_positions
+            if current_time - pos[4] < self.position_dedup_time_window
+        ]
+        
+        # 如果提供了bbox，检查位置是否已报警（处理track_id变化的情况）
+        if bbox is not None:
+            for pos_bbox, pos_timestamp in [(pos[:4], pos[4]) for pos in self.alerted_positions]:
+                iou = self._compute_bbox_iou(bbox, pos_bbox)
+                if iou > self.position_dedup_iou_threshold:
+                    # 位置重叠且未过期，认为是同一位置，不再报警
+                    return False
         
         # 检查停留时间
         duration = current_time - self.track_enter_time[track_id]
@@ -160,6 +224,26 @@ class LoiteringDetector:
         
         return False
     
+    def mark_alerted(self, track_id: int, bbox: Optional[Tuple[float, float, float, float]] = None, current_time: Optional[float] = None):
+        """
+        标记track和位置已报警（避免重复报警）
+        
+        Args:
+            track_id: 跟踪ID
+            bbox: 边界框 [x1, y1, x2, y2]，用于位置去重
+            current_time: 当前时间戳（秒），如果为None则使用time.time()
+        """
+        if current_time is None:
+            current_time = time.time()
+        
+        # 标记track已报警
+        self.alerted_tracks[track_id] = current_time
+        
+        # 如果提供了bbox，记录位置（用于track_id变化时的去重）
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            self.alerted_positions.append((x1, y1, x2, y2, current_time))
+    
     def reset(self, track_id: int):
         """
         重置指定track的徘徊检测状态
@@ -171,6 +255,8 @@ class LoiteringDetector:
             del self.track_enter_time[track_id]
         if track_id in self.track_positions:
             del self.track_positions[track_id]
+        if track_id in self.alerted_tracks:
+            del self.alerted_tracks[track_id]
     
     def cleanup(self, active_track_ids: set):
         """
@@ -179,6 +265,7 @@ class LoiteringDetector:
         Args:
             active_track_ids: 当前活跃的track ID集合
         """
+        # 清理位置历史
         expired_tracks = (
             set(self.track_enter_time.keys()) |
             set(self.track_positions.keys())

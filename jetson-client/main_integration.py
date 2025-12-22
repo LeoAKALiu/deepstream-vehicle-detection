@@ -498,13 +498,13 @@ class SentinelIntegration:
                 
                 # 获取当前帧
                 if not self.frame_callback:
-                    logger.debug("Frame callback not set, skipping monitoring snapshot")
+                    logger.warning("Frame callback not set, skipping monitoring snapshot")
                     continue
                 
                 try:
                     frame = self.frame_callback()
                     if frame is None:
-                        logger.debug("No frame available, skipping monitoring snapshot")
+                        logger.warning("No frame available, skipping monitoring snapshot")
                         continue
                 except Exception as e:
                     logger.warning(f"Error getting frame for monitoring snapshot: {e}")

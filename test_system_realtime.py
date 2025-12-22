@@ -1113,12 +1113,14 @@ class RealtimeVehicleDetection:
         print("\n【5. 初始化Orbbec相机】")
         if use_depth:
             try:
-                # 从配置读取无效深度值范围
+                # 从配置读取无效深度值范围和格式偏好
                 invalid_min = depth_cfg.get('invalid_min', 0)
                 invalid_max = depth_cfg.get('invalid_max', 65535)
+                prefer_uncompressed = depth_cfg.get('prefer_uncompressed_format', True)
                 self.depth_camera = OrbbecDepthCamera(
                     invalid_min=invalid_min,
-                    invalid_max=invalid_max
+                    invalid_max=invalid_max,
+                    prefer_uncompressed_format=prefer_uncompressed
                 )
                 self.depth_camera.start()
                 print("✓ Orbbec相机启动成功")
@@ -1236,6 +1238,10 @@ class RealtimeVehicleDetection:
                 print(f"\n【9. 检测结果数据库】")
                 print(f"⚠ 数据库初始化失败: {e}")
                 self.detection_db = None
+        
+        # 确保snapshot_dir已设置（在数据留存管理器初始化之前）
+        if not hasattr(self, 'snapshot_dir'):
+            self.snapshot_dir = paths_cfg.get('snapshot_dir', '/tmp/vehicle_snapshots')
         
         # 数据留存管理器（可选）
         self.data_retention_manager = None
@@ -2017,7 +2023,7 @@ class RealtimeVehicleDetection:
                 
                 if self.loitering_detector and self.loitering_apply_to_unregistered_only:
                     import time
-                    is_loitering = self.loitering_detector.is_loitering(track_id, time.time())
+                    is_loitering = self.loitering_detector.is_loitering(track_id, bbox, time.time())
                     should_alert = is_loitering
                     
                     if not is_loitering:
@@ -2025,6 +2031,10 @@ class RealtimeVehicleDetection:
                         print(f"\n  ⏳ 未备案车辆，但未满足徘徊条件（停留时间: {duration:.1f}s < {self.loitering_detector.min_duration}s），暂不报警")
                         print(f"{'='*70}\n")
                         return None  # 不创建alert
+                    
+                    # 如果满足徘徊条件，标记为已报警（避免重复报警）
+                    if is_loitering:
+                        self.loitering_detector.mark_alerted(track_id, bbox, time.time())
                 
                 alert = {
                     'track_id': track_id,
@@ -2045,7 +2055,7 @@ class RealtimeVehicleDetection:
             
             if self.loitering_detector and self.loitering_apply_to_unregistered_only:
                 import time
-                is_loitering = self.loitering_detector.is_loitering(track_id, time.time())
+                is_loitering = self.loitering_detector.is_loitering(track_id, bbox, time.time())
                 should_alert = is_loitering
                 
                 if not is_loitering:
@@ -2053,6 +2063,10 @@ class RealtimeVehicleDetection:
                     print(f"\n  ⏳ 未备案车辆，但未满足徘徊条件（停留时间: {duration:.1f}s < {self.loitering_detector.min_duration}s），暂不报警")
                     print(f"{'='*70}\n")
                     return None  # 不创建alert
+                
+                # 如果满足徘徊条件，标记为已报警（避免重复报警）
+                if is_loitering:
+                    self.loitering_detector.mark_alerted(track_id, bbox, time.time())
             
             alert = {
                 'track_id': track_id,
